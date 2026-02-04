@@ -1,0 +1,24 @@
+{
+  "name": "ucm",
+  "version": "0.1.0",
+  "description": "Ultimate Click Machine — 소프트웨어 팩토리 빌딩 블록",
+  "bin": {
+    "mem": "./bin/mem.js",
+    "memd": "./bin/memd.js",
+    "rsa": "./bin/rsa.js",
+    "qna": "./bin/qna.js",
+    "spec": "./bin/spec.js",
+    "prl": "./bin/prl.js",
+    "req": "./bin/req.js"
+  },
+  "main": "./lib/mem.js",
+  "files": ["bin/", "lib/", "templates/", "skill/", "scripts/", "docs/"],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js",
+    "install-skill": "node scripts/install-skill.js"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
