@@ -9,10 +9,20 @@
     "qna": "./bin/qna.js",
     "spec": "./bin/spec.js",
     "prl": "./bin/prl.js",
-    "req": "./bin/req.js"
+    "req": "./bin/req.js",
+    "ucmd": "./bin/ucmd.js",
+    "ucm-watchdog": "./bin/ucm-watchdog.js",
+    "ucm": "./bin/ucm.js"
   },
   "main": "./lib/mem.js",
-  "files": ["bin/", "lib/", "templates/", "skill/", "scripts/", "docs/"],
+  "files": [
+    "bin/",
+    "lib/",
+    "templates/",
+    "skill/",
+    "scripts/",
+    "docs/"
+  ],
   "scripts": {
     "postinstall": "node scripts/postinstall.js",
     "install-skill": "node scripts/install-skill.js"
@@ -20,5 +30,9 @@
   "license": "MIT",
   "engines": {
     "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0",
+    "ws": "^8.19.0"
   }
 }
