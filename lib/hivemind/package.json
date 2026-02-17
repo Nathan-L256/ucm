@@ -1,0 +1,26 @@
+{
+  "name": "hivemind-memory",
+  "version": "0.1.0",
+  "description": "Zettelkasten-style knowledge memory for AI coding assistants",
+  "bin": {
+    "hm": "./bin/hm.js",
+    "hmd": "./bin/hmd.js"
+  },
+  "main": "./index.js",
+  "files": [
+    "bin/",
+    "adapters/",
+    "*.js"
+  ],
+  "scripts": {
+    "test": "node ../../test/hivemind.test.js"
+  },
+  "author": "Jugwan Kim",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.6.2"
+  }
+}

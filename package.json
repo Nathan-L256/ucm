@@ -12,7 +12,9 @@
     "req": "./bin/req.js",
     "ucmd": "./bin/ucmd.js",
     "ucm-watchdog": "./bin/ucm-watchdog.js",
-    "ucm": "./bin/ucm.js"
+    "ucm": "./bin/ucm.js",
+    "hm": "./bin/hm.js",
+    "hmd": "./bin/hmd.js"
   },
   "main": "./lib/mem.js",
   "files": [
@@ -24,14 +26,30 @@
     "docs/"
   ],
   "scripts": {
+    "test": "node test/ucm.test.js && node test/hivemind.test.js",
     "postinstall": "node scripts/postinstall.js",
     "install-skill": "node scripts/install-skill.js"
   },
+  "author": "Jugwan Kim",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Nathan-L256/ucm.git"
+  },
+  "homepage": "https://github.com/Nathan-L256/ucm#readme",
+  "keywords": [
+    "memory",
+    "knowledge-base",
+    "zettelkasten",
+    "llm",
+    "claude",
+    "ai-assistant"
+  ],
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "better-sqlite3": "^12.6.2",
     "node-pty": "^1.0.0",
     "ws": "^8.19.0"
   }

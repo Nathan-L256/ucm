@@ -134,8 +134,8 @@ UCM 파이프라인 내부에서 사용되는 독립 도구들. 단독으로도 
 | `spec` | EARS 요구사항 스펙 생성 + 7개 기준 검증 |
 | `req` | qna → spec 반복 워크플로 |
 | `prl` | 병렬 프롬프트 실행 |
-| `mem` | 기억 관리 (save/search/boost/gc) |
-| `memd` | 세션 감시 데몬 (자동 지식 축적) |
+| `hm` | hivemind 지식 기억 관리 (search/add/gc) |
+| `hmd` | hivemind 데몬 (세션 자동 수집 + 지식 추출) |
 
 ## 디렉토리 구조
 

@@ -1,18 +1,15 @@
 ---
-description: Search and retrieve memories from past sessions
-argument-hint: [search query]
+description: "이전 작업 기억 조회 — /recall webhook, /recall vue 깜빡임"
+argument-hint: <검색어>
 allowed-tools: Bash, Read
 ---
 
-과거 세션에서 축적된 기억을 검색하여 현재 작업에 활용합니다.
-
 ## 검색 결과
 
-!`if [ -z "$ARGUMENTS" ]; then mem context --all --limit 5; else mem search --all $ARGUMENTS; fi`
+!`if [ -z "$ARGUMENTS" ]; then hm list --limit 10; else hm search --limit 10 $ARGUMENTS; fi`
 
 ## 지침
 
-1. 위 검색 결과에서 파일 경로(.md)를 Read tool로 읽어라 (상위 5개까지)
-2. 읽은 기억 중 현재 작업과 관련된 P1 내용(결정/이유)을 우선 요약해라
-3. P2(구현 세부)는 직접 코드를 수정할 때만 참고해라
-4. 검색 결과가 없으면 사용자에게 알려라
+1. 위 검색 결과에서 관련도 높은 Zettel 경로(.md)를 Read로 읽어라 (상위 5개까지)
+2. 현재 작업과 직접 관련된 내용만 간결히 요약해라
+3. 결과가 없으면 "관련 기억이 없습니다"로 짧게 안내해라
