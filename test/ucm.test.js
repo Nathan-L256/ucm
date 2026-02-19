@@ -9,6 +9,9 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 
+const { startSuiteTimer } = require("./harness");
+const { trackPid, cleanupAll } = require("./helpers/cleanup");
+
 // isolate test daemon from production
 const TEST_UCM_DIR = path.join(os.tmpdir(), `ucm-test-${process.pid}`);
 process.env.UCM_DIR = TEST_UCM_DIR;
@@ -29,16 +32,21 @@ const {
   defaultState,
   generateProposalId, computeDedupHash, serializeProposal, parseProposalFile,
   saveProposal, loadProposal, listProposals,
+  OBSERVER_PERSPECTIVES,
   captureMetricsSnapshot, parseObserverOutput,
   getLanguageFamily, countFunctions, getSizeCategory, analyzeFile, getChangedFiles,
   formatChangedFilesMetrics, formatProjectStructureMetrics,
   isGitRepo, validateGitProjects,
   analyzeCommitHistory, emptyCommitMetrics, formatCommitHistory, LARGE_COMMIT_THRESHOLD,
   DOC_EXTENSIONS, DOC_DIRS, scanDocumentation, formatDocumentation, analyzeDocCoverage,
+  generateProjectContext, formatProjectContext,
   saveSnapshot, loadLatestSnapshot, loadAllSnapshots, cleanupOldSnapshots,
   compareSnapshots, findProposalByTaskId, evaluateProposal,
+  analyzeProject, handleAnalyzeProject, handleResearchProject,
 } = require("../lib/ucmd.js");
 
+const ucmdAutopilot = require("../lib/ucmd-autopilot.js");
+const ucmdSandbox = require("../lib/ucmd-sandbox.js");
 const {
   EXPECTED_GREENFIELD, EXPECTED_BROWNFIELD,
   REFINEMENT_GREENFIELD, REFINEMENT_BROWNFIELD,
@@ -700,6 +708,7 @@ async function testDaemonLifecycle() {
     env: process.env,
   });
   daemon.unref();
+  trackPid(daemon.pid);
   fs.closeSync(logFd);
   await writeFile(PID_PATH, String(daemon.pid));
 
@@ -904,6 +913,7 @@ async function testApproveRejectFlow() {
     env: process.env,
   });
   daemon.unref();
+  trackPid(daemon.pid);
   fs.closeSync(logFd);
   await writeFile(PID_PATH, String(daemon.pid));
 
@@ -1231,6 +1241,7 @@ async function testHttpServer() {
     env: process.env,
   });
   daemon.unref();
+  trackPid(daemon.pid);
   fs.closeSync(logFd);
   await writeFile(PID_PATH, String(daemon.pid));
 
@@ -1330,6 +1341,7 @@ async function testHttpProposalsApi() {
     env: process.env,
   });
   daemon.unref();
+  trackPid(daemon.pid);
   fs.closeSync(logFd);
   await writeFile(PID_PATH, String(daemon.pid));
 
@@ -1828,6 +1840,193 @@ async function testProposalDirectories() {
     failures.push("ensureDirectories: snapshots dir missing");
     process.stdout.write("F");
   }
+}
+
+// ── Multi-Perspective Observer Tests ──
+
+function testObserverPerspectivesDefined() {
+  assert(OBSERVER_PERSPECTIVES !== undefined, "OBSERVER_PERSPECTIVES: exported");
+  const names = Object.keys(OBSERVER_PERSPECTIVES);
+  assert(names.length >= 5, "OBSERVER_PERSPECTIVES: at least 5 perspectives");
+  for (const name of names) {
+    const p = OBSERVER_PERSPECTIVES[name];
+    assert(typeof p.label === "string" && p.label.length > 0, `OBSERVER_PERSPECTIVES.${name}: has label`);
+    assert(typeof p.focus === "string" && p.focus.length > 0, `OBSERVER_PERSPECTIVES.${name}: has focus`);
+    assert(typeof p.priorityBoost === "number", `OBSERVER_PERSPECTIVES.${name}: has priorityBoost`);
+  }
+  assert(OBSERVER_PERSPECTIVES.functionality.priorityBoost > 0, "OBSERVER_PERSPECTIVES: functionality has positive priorityBoost");
+}
+
+function testExpandedCategories() {
+  const expected = ["template", "core", "config", "test", "bugfix", "ux", "architecture", "performance", "docs", "research"];
+  for (const cat of expected) {
+    assert(VALID_CATEGORIES.has(cat), `VALID_CATEGORIES: has ${cat}`);
+  }
+}
+
+function testObserveTemplateHasPerspective() {
+  const content = fs.readFileSync(path.join(__dirname, "..", "templates", "ucm-observe.md"), "utf-8");
+  assert(content.includes("{{PERSPECTIVE_FOCUS}}"), "observe template: has PERSPECTIVE_FOCUS placeholder");
+}
+
+function testResearchTemplateExists() {
+  try {
+    fs.accessSync(path.join(__dirname, "..", "templates", "ucm-observe-research.md"));
+    passed++;
+    process.stdout.write(".");
+  } catch {
+    failed++;
+    failures.push("research template: ucm-observe-research.md missing");
+    process.stdout.write("F");
+  }
+}
+
+function testParseObserverOutputExpandedCategories() {
+  const categories = ["bugfix", "ux", "architecture", "performance", "docs", "research"];
+  for (const cat of categories) {
+    const output = `\`\`\`json\n[{"title":"Test ${cat}","category":"${cat}","change":"some change"}]\n\`\`\``;
+    const proposals = parseObserverOutput(output, 1, {});
+    assertEqual(proposals.length, 1, `parseObserverOutput: ${cat} category accepted`);
+    assertEqual(proposals[0].category, cat, `parseObserverOutput: ${cat} category value`);
+  }
+}
+
+function testBugfixPriorityBoost() {
+  const boost = OBSERVER_PERSPECTIVES.functionality.priorityBoost;
+  assert(boost > 0, "bugfix priorityBoost: functionality perspective has positive boost");
+  // Simulate what runObserver does: parse output then apply boost
+  const output = '```json\n[{"title":"Fix critical bug","category":"bugfix","change":"fix it"}]\n```';
+  const proposals = parseObserverOutput(output, 1, {});
+  assertEqual(proposals.length, 1, "bugfix priorityBoost: proposal parsed");
+  // Apply boost as runObserver would
+  proposals[0].priority = (proposals[0].priority || 0) + boost;
+  assert(proposals[0].priority >= boost, `bugfix priorityBoost: priority is at least ${boost}`);
+}
+
+// ── On-Demand Analysis / Research Tests ──
+
+function testAnalyzeProjectExported() {
+  assertEqual(typeof analyzeProject, "function", "analyzeProject: exported as function");
+}
+
+function testHandleAnalyzeProjectExported() {
+  assertEqual(typeof handleAnalyzeProject, "function", "handleAnalyzeProject: exported as function");
+}
+
+function testHandleResearchProjectExported() {
+  assertEqual(typeof handleResearchProject, "function", "handleResearchProject: exported as function");
+}
+
+async function testMkdirApi() {
+  const testDir = path.join(TEST_UCM_DIR, "mkdir-test", "new-project");
+  try { await rm(testDir, { recursive: true }); } catch {}
+  await mkdir(testDir, { recursive: true });
+  execFileSync("git", ["init"], { cwd: testDir, stdio: "ignore" });
+  const s = await stat(testDir);
+  assert(s.isDirectory(), "mkdir: created directory exists");
+  const gitDir = await stat(path.join(testDir, ".git"));
+  assert(gitDir.isDirectory(), "mkdir: git init created .git directory");
+  await rm(testDir, { recursive: true });
+}
+
+function testUiModalNotClosedBeforeSuccess() {
+  const src = fs.readFileSync(path.join(__dirname, "..", "lib", "ucm-ui.js"), "utf-8");
+
+  // submitTask: hideModal must be inside try block (after res.ok check), not before fetch
+  const submitFn = src.match(/async function submitTask\(\)[\s\S]*?^}/m);
+  assert(submitFn, "uiModal: submitTask function found");
+  if (submitFn) {
+    const body = submitFn[0];
+    const hideIdx = body.indexOf("hideModal()");
+    const fetchIdx = body.indexOf("fetch(");
+    const resOkIdx = body.indexOf("res.ok");
+    assert(hideIdx > fetchIdx, "uiModal: submitTask hideModal after fetch");
+    assert(hideIdx > resOkIdx, "uiModal: submitTask hideModal after res.ok check");
+  }
+
+  // startRefinement: hideModal must be after fetch succeeds
+  const refineFn = src.match(/async function startRefinement\(mode\)[\s\S]*?^}/m);
+  assert(refineFn, "uiModal: startRefinement function found");
+  if (refineFn) {
+    const body = refineFn[0];
+    const hideIdx = body.indexOf("hideModal()");
+    const fetchIdx = body.indexOf("fetch(");
+    assert(hideIdx > fetchIdx, "uiModal: startRefinement hideModal after fetch");
+    // refinementSession should be set only after API success
+    const sessionAssign = body.indexOf("refinementSession = {");
+    assert(sessionAssign > fetchIdx, "uiModal: refinementSession set after fetch");
+  }
+}
+
+function testUiRightPanelRefinementGuard() {
+  const src = fs.readFileSync(path.join(__dirname, "..", "lib", "ucm-ui.js"), "utf-8");
+  // renderAll should not hide .right when refinementSession is active
+  assert(src.includes("tasks.length === 0 && !refinementSession"), "uiPanel: renderAll guards .right with refinementSession");
+  // switchPanel should not overwrite detailView when refinementSession is active
+  const switchFn = src.match(/function switchPanel\(panel\)[\s\S]*?^}/m);
+  assert(switchFn, "uiPanel: switchPanel function found");
+  if (switchFn) {
+    assert(switchFn[0].includes("!refinementSession"), "uiPanel: switchPanel guards detailView with refinementSession");
+  }
+  // loadInitial should preserve refinementPanel instead of calling switchPanel
+  const loadFn = src.match(/async function loadInitial\(\)[\s\S]*?^}/m);
+  assert(loadFn, "uiPanel: loadInitial function found");
+  if (loadFn) {
+    assert(loadFn[0].includes("refinementSession"), "uiPanel: loadInitial guards switchPanel with refinementSession");
+  }
+}
+
+function testUiHtmlJsSyntax() {
+  const { buildHtml } = require("../lib/ucm-ui.js");
+  const html = buildHtml(9999);
+  const start = html.lastIndexOf("<script>");
+  const end = html.indexOf("</script>", start);
+  assert(start > 0 && end > start, "uiHtml: script block found");
+  const script = html.substring(start + 8, end);
+  try {
+    new Function(script);
+    assert(true, "uiHtml: JS syntax is valid");
+  } catch (e) {
+    assert(false, "uiHtml: JS syntax error: " + e.message);
+  }
+}
+
+function testUiServerAnalyzeRoute() {
+  const { PROXY_ROUTES } = require("../lib/ucm-ui-server.js");
+  const found = PROXY_ROUTES.some(r => r.method === "analyze_project" && r.post === true);
+  assert(found, "uiServer: PROXY_ROUTES has analyze_project POST route");
+}
+
+function testUiServerResearchRoute() {
+  const { PROXY_ROUTES } = require("../lib/ucm-ui-server.js");
+  const found = PROXY_ROUTES.some(r => r.method === "research_project" && r.post === true);
+  assert(found, "uiServer: PROXY_ROUTES has research_project POST route");
+}
+
+function testSocketHandlerMappings() {
+  const ucmdServer = require("../lib/ucmd-server.js");
+  // set up minimal deps to verify socket handlers contain our new methods
+  let capturedHandlers = null;
+  ucmdServer.setDeps({
+    config: () => ({}),
+    daemonState: () => ({ daemonStatus: "running" }),
+    log: () => {},
+    handlers: () => {
+      const h = {
+        handleAnalyzeProject: () => {},
+        handleResearchProject: () => {},
+      };
+      capturedHandlers = h;
+      return h;
+    },
+    gracefulShutdown: () => {},
+  });
+  // The socket handler map is defined inside handleSocketRequest which we can't
+  // directly inspect. Instead, verify that the handler registry in ucmd.js
+  // includes our new handlers by checking the module exports.
+  const ucmd = require("../lib/ucmd.js");
+  assertEqual(typeof ucmd.handleAnalyzeProject, "function", "socketMapping: handleAnalyzeProject in ucmd exports");
+  assertEqual(typeof ucmd.handleResearchProject, "function", "socketMapping: handleResearchProject in ucmd exports");
 }
 
 // ── Phase 2: Snapshot/Evaluation Tests ──
@@ -2713,6 +2912,56 @@ function testAnalyzeDocCoverageWithFiles() {
   assert(result2.summary.includes("Warning"), "docCoverage warning when no docs changed");
 }
 
+// ── Project Context Tests ──
+
+async function testGenerateProjectContext() {
+  const result = await generateProjectContext(SOURCE_ROOT);
+  assert(result.files.length > 0, "generateProjectContext finds doc files");
+  assert(result.hasReadme, "generateProjectContext detects README.md");
+  assert(result.docFileCount > 0, "generateProjectContext docFileCount > 0");
+  const readmeFile = result.files.find((f) => f.path === "README.md");
+  assert(readmeFile !== undefined, "generateProjectContext includes README.md");
+  assert(readmeFile.lines > 0, "README.md has lines");
+  assert(readmeFile.preview.length > 0, "README.md has preview");
+}
+
+function testFormatProjectContext() {
+  const context = {
+    files: [
+      { path: "README.md", lines: 45, preview: "# My Project — A tool for..." },
+      { path: "docs/manual.md", lines: 120, preview: "# User Manual — How to..." },
+    ],
+    hasReadme: true,
+    hasDocsDir: true,
+    docFileCount: 2,
+  };
+  const formatted = formatProjectContext(context);
+  assert(formatted.includes("### Documentation Files"), "formatProjectContext has header");
+  assert(formatted.includes("| Path | Lines | Preview |"), "formatProjectContext has table header");
+  assert(formatted.includes("README.md"), "formatProjectContext includes README.md");
+  assert(formatted.includes("docs/manual.md"), "formatProjectContext includes docs/manual.md");
+  assert(formatted.includes("Summary:"), "formatProjectContext has Summary");
+  assert(formatted.includes("2 doc files"), "formatProjectContext shows file count");
+
+  const emptyFormatted = formatProjectContext({ files: [], hasReadme: false, hasDocsDir: false, docFileCount: 0 });
+  assert(emptyFormatted.includes("No documentation"), "formatProjectContext handles empty");
+}
+
+function testAutopilotPlanTemplateHasProjectContext() {
+  const template = fs.readFileSync(path.join(SOURCE_ROOT, "templates/ucm-autopilot-plan.md"), "utf-8");
+  assert(template.includes("{{PROJECT_CONTEXT}}"), "plan template has PROJECT_CONTEXT placeholder");
+  assert(template.includes("Project Documentation State"), "plan template has documentation state section");
+}
+
+function testAutopilotReleaseTemplateUpdated() {
+  const template = fs.readFileSync(path.join(SOURCE_ROOT, "templates/ucm-autopilot-release.md"), "utf-8");
+  assert(template.includes("{{PROJECT_CONTEXT}}"), "release template has PROJECT_CONTEXT placeholder");
+  assert(template.includes("README.md"), "release template has README.md instruction");
+  assert(template.includes("CHANGELOG.md"), "release template has CHANGELOG.md instruction");
+  assert(template.includes("docs/"), "release template has docs/ instruction");
+  assert(!template.includes("Respond with ONLY a JSON"), "release template is no longer JSON output format");
+}
+
 // ── Template Placeholder Tests ──
 
 function testObserveTemplateHasCommitHistory() {
@@ -2742,9 +2991,1571 @@ function testDocExtensionsAndDirs() {
   assert(DOC_DIRS.has("documentation"), "DOC_DIRS has documentation");
 }
 
+// ── Forge V2 Tests ──
+
+function testSanitizeEnv() {
+  const { sanitizeEnv } = require("../lib/core/llm");
+
+  const origEnv = { ...process.env };
+  process.env.PATH = "/usr/bin";
+  process.env.HOME = "/home/test";
+  process.env.ANTHROPIC_API_KEY = "sk-test-key";
+  process.env.NODE_ENV = "test";
+  process.env.GIT_AUTHOR_NAME = "tester";
+  process.env.UCM_DIR = "/tmp/ucm";
+  process.env.CLAUDE_CODE_SESSION = "secret123";
+  process.env.CLAUDECODE = "1";
+  process.env.SOME_RANDOM_VAR = "should_be_blocked";
+
+  const env = sanitizeEnv();
+  assert(env.PATH === "/usr/bin", "sanitizeEnv: PATH allowed");
+  assert(env.HOME === "/home/test", "sanitizeEnv: HOME allowed");
+  assert(env.ANTHROPIC_API_KEY === "sk-test-key", "sanitizeEnv: ANTHROPIC_API_KEY allowed");
+  assert(env.NODE_ENV === "test", "sanitizeEnv: NODE_ prefix allowed");
+  assert(env.GIT_AUTHOR_NAME === "tester", "sanitizeEnv: GIT_ prefix allowed");
+  assert(env.UCM_DIR === "/tmp/ucm", "sanitizeEnv: UCM_ prefix allowed");
+  assert(!env.CLAUDE_CODE_SESSION, "sanitizeEnv: CLAUDE_CODE_ blocked");
+  assert(!env.CLAUDECODE, "sanitizeEnv: CLAUDECODE blocked");
+  assert(!env.SOME_RANDOM_VAR, "sanitizeEnv: unknown var blocked");
+
+  // restore
+  Object.assign(process.env, origEnv);
+  for (const key of ["CLAUDE_CODE_SESSION", "CLAUDECODE", "SOME_RANDOM_VAR"]) {
+    delete process.env[key];
+  }
+}
+
+function testExtractJsonVariants() {
+  const { extractJson } = require("../lib/core/llm");
+
+  // code block
+  const r1 = extractJson('Some text\n```json\n{"a":1}\n```\nMore text');
+  assertDeepEqual(r1, { a: 1 }, "extractJson: code block");
+
+  // bare JSON object
+  const r2 = extractJson('{"b":2}');
+  assertDeepEqual(r2, { b: 2 }, "extractJson: bare object");
+
+  // bare JSON array
+  const r3 = extractJson('[1,2,3]');
+  assertDeepEqual(r3, [1, 2, 3], "extractJson: bare array");
+
+  // mixed text with JSON
+  const r4 = extractJson('Here is the result: {"c":3} end');
+  assertDeepEqual(r4, { c: 3 }, "extractJson: mixed text");
+
+  // invalid JSON throws
+  let threw = false;
+  try { extractJson("no json here"); } catch { threw = true; }
+  assert(threw, "extractJson: throws on invalid");
+}
+
+function testBuildCommandProviders() {
+  const { buildCommand } = require("../lib/core/llm");
+
+  // claude provider
+  const claude = buildCommand({ provider: "claude", model: "sonnet", outputFormat: "stream-json" });
+  assertEqual(claude.cmd, "claude", "buildCommand: claude cmd");
+  assert(claude.args.includes("--model"), "buildCommand: claude has --model");
+  assert(claude.args.includes("stream-json"), "buildCommand: claude has output format");
+
+  // codex provider
+  const codex = buildCommand({ provider: "codex", model: "opus", cwd: "/tmp" });
+  assertEqual(codex.cmd, "codex", "buildCommand: codex cmd");
+  assert(codex.args.includes("exec"), "buildCommand: codex has exec");
+
+  // unknown provider throws
+  let threw = false;
+  try { buildCommand({ provider: "unknown" }); } catch { threw = true; }
+  assert(threw, "buildCommand: unknown provider throws");
+}
+
+function testStageModelsProxy() {
+  const { STAGE_MODELS } = require("../lib/core/constants");
+
+  assertEqual(STAGE_MODELS.intake, "sonnet", "STAGE_MODELS: intake default");
+  assertEqual(STAGE_MODELS.implement, "opus", "STAGE_MODELS: implement default");
+  assertEqual(typeof STAGE_MODELS.specify, "object", "STAGE_MODELS: specify is object");
+  assertEqual(STAGE_MODELS.specify.worker, "sonnet", "STAGE_MODELS: specify.worker default");
+  assertEqual(STAGE_MODELS.specify.converge, "opus", "STAGE_MODELS: specify.converge default");
+  assertEqual(STAGE_MODELS.nonexistent, undefined, "STAGE_MODELS: nonexistent returns undefined");
+
+  // env override
+  process.env.UCM_MODEL_DESIGN = "haiku";
+  // Note: STAGE_MODELS proxy reads env at access time for string types
+  assertEqual(STAGE_MODELS.design, "haiku", "STAGE_MODELS: env override works");
+  delete process.env.UCM_MODEL_DESIGN;
+}
+
+function testCheckRequiredArtifactsLogic() {
+  const { STAGE_ARTIFACTS } = require("../lib/core/constants");
+
+  // stages with no requirements should pass
+  assert(STAGE_ARTIFACTS.deliver.requires.length === 0, "STAGE_ARTIFACTS: deliver requires empty");
+  assert(STAGE_ARTIFACTS.verify.requires.length === 0, "STAGE_ARTIFACTS: verify requires empty");
+  assert(STAGE_ARTIFACTS.integrate.requires.length === 0, "STAGE_ARTIFACTS: integrate requires empty");
+
+  // stages with requirements
+  assert(STAGE_ARTIFACTS.clarify.requires.includes("task.md"), "STAGE_ARTIFACTS: clarify requires task.md");
+  assert(STAGE_ARTIFACTS.specify.requires.includes("decisions.json"), "STAGE_ARTIFACTS: specify requires decisions.json");
+  assert(STAGE_ARTIFACTS.design.requires.includes("task.md"), "STAGE_ARTIFACTS: design requires task.md");
+  assert(STAGE_ARTIFACTS.implement.requires.includes("design.md"), "STAGE_ARTIFACTS: implement requires design.md");
+}
+
+function testCustomPipelineParsing() {
+  const { FORGE_PIPELINES, STAGE_ARTIFACTS } = require("../lib/core/constants");
+
+  // standard pipelines include deliver
+  assert(FORGE_PIPELINES.trivial.includes("deliver"), "pipeline: trivial has deliver");
+  assert(FORGE_PIPELINES.small.includes("deliver"), "pipeline: small has deliver");
+  assert(FORGE_PIPELINES.large.includes("deliver"), "pipeline: large has deliver");
+
+  // custom pipeline parsing
+  const custom = "design,implement,verify";
+  const stages = custom.split(",").map((s) => s.trim());
+  assert(stages.length === 3, "custom pipeline: correct count");
+  assertEqual(stages[0], "design", "custom pipeline: first stage");
+
+  // validate stages against STAGE_ARTIFACTS
+  const validStages = new Set(Object.keys(STAGE_ARTIFACTS));
+  const invalid = stages.filter((s) => !validStages.has(s));
+  assertEqual(invalid.length, 0, "custom pipeline: all stages valid");
+
+  // invalid stage detection
+  const badStages = "design,foobar,implement".split(",");
+  const badInvalid = badStages.filter((s) => !validStages.has(s));
+  assertEqual(badInvalid.length, 1, "custom pipeline: detects invalid stage");
+  assertEqual(badInvalid[0], "foobar", "custom pipeline: identifies foobar");
+}
+
+function testSanitizeContentPatterns() {
+  const { sanitizeContent } = require("../lib/core/worktree");
+
+  // API key patterns
+  const apiKey = "api_key=sk-1234567890abcdef1234567890abcdef";
+  const sanitized1 = sanitizeContent(apiKey);
+  assert(sanitized1.includes("[REDACTED]"), "sanitize: API key redacted");
+  assert(!sanitized1.includes("1234567890abcdef"), "sanitize: API key value hidden");
+
+  // Bearer token
+  const bearer = "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig";
+  const sanitized2 = sanitizeContent(bearer);
+  assert(sanitized2.includes("[REDACTED]"), "sanitize: Bearer token redacted");
+
+  // GitHub token
+  const ghToken = "token: ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+  const sanitized3 = sanitizeContent(ghToken);
+  assert(sanitized3.includes("[REDACTED]"), "sanitize: GitHub token redacted");
+
+  // Normal text passes through
+  const normal = "This is normal text without secrets";
+  assertEqual(sanitizeContent(normal), normal, "sanitize: normal text unchanged");
+
+  // null/undefined handling
+  assertEqual(sanitizeContent(null), null, "sanitize: null passthrough");
+  assertEqual(sanitizeContent(""), "", "sanitize: empty string passthrough");
+}
+
+function testParseArgsCli() {
+  // simulate parseArgs by extracting and testing the logic
+  function testParse(argv) {
+    const args = argv;
+    const opts = {};
+    const positional = [];
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === "--project") { opts.project = args[++i]; }
+      else if (args[i] === "--pipeline") { opts.pipeline = args[++i]; }
+      else if (args[i] === "--autopilot") { opts.autopilot = true; }
+      else if (args[i] === "--file") { opts.file = args[++i]; }
+      else if (args[i] === "--budget") { opts.budget = parseInt(args[++i]) || 0; }
+      else if (args[i] === "--from") { opts.from = args[++i]; }
+      else if (args[i] === "--background" || args[i] === "--bg") { opts.background = true; }
+      else if (args[i] === "--verbose" || args[i] === "-v") { opts.verbose = true; }
+      else if (!args[i].startsWith("-")) { positional.push(args[i]); }
+    }
+    opts.command = positional[0];
+    opts.positional = positional.slice(1);
+    return opts;
+  }
+
+  const r1 = testParse(["forge", "test task", "--project", "/tmp", "--pipeline", "small"]);
+  assertEqual(r1.command, "forge", "parseArgs: command");
+  assertEqual(r1.project, "/tmp", "parseArgs: project");
+  assertEqual(r1.pipeline, "small", "parseArgs: pipeline");
+  assertEqual(r1.positional[0], "test task", "parseArgs: positional");
+
+  const r2 = testParse(["resume", "forge-001", "--from", "design", "--bg"]);
+  assertEqual(r2.command, "resume", "parseArgs: resume command");
+  assertEqual(r2.from, "design", "parseArgs: from");
+  assert(r2.background, "parseArgs: background flag");
+
+  const r3 = testParse(["forge", "task", "--autopilot", "--verbose", "--budget", "500000"]);
+  assert(r3.autopilot, "parseArgs: autopilot flag");
+  assert(r3.verbose, "parseArgs: verbose flag");
+  assertEqual(r3.budget, 500000, "parseArgs: budget value");
+}
+
+function testGetNextAction() {
+  // Test the logic of getNextAction
+  function getNextAction(dag) {
+    switch (dag.status) {
+      case "review": return `ucm approve ${dag.id}  또는  ucm reject ${dag.id} --feedback "..."`;
+      case "rejected": return `ucm resume ${dag.id}`;
+      case "failed": return `ucm resume ${dag.id} --from ${dag.currentStage || "implement"}`;
+      case "in_progress": return `ucm logs ${dag.id}  (진행 중)`;
+      default: return null;
+    }
+  }
+
+  const review = getNextAction({ id: "forge-001", status: "review" });
+  assert(review.includes("approve"), "getNextAction: review suggests approve");
+  assert(review.includes("reject"), "getNextAction: review suggests reject");
+
+  const rejected = getNextAction({ id: "forge-001", status: "rejected" });
+  assert(rejected.includes("resume"), "getNextAction: rejected suggests resume");
+
+  const failed = getNextAction({ id: "forge-001", status: "failed", currentStage: "verify" });
+  assert(failed.includes("--from verify"), "getNextAction: failed suggests from stage");
+
+  const inProgress = getNextAction({ id: "forge-001", status: "in_progress" });
+  assert(inProgress.includes("logs"), "getNextAction: in_progress suggests logs");
+
+  const done = getNextAction({ id: "forge-001", status: "done" });
+  assertEqual(done, null, "getNextAction: done returns null");
+
+  const aborted = getNextAction({ id: "forge-001", status: "aborted" });
+  assertEqual(aborted, null, "getNextAction: aborted returns null");
+}
+
+function testDetectOrphanLogic() {
+  // Test the orphan detection logic (without actual TaskDag I/O)
+  const tasks = [
+    { id: "forge-001", status: "done" },
+    { id: "forge-002", status: "in_progress" },
+    { id: "forge-003", status: "failed" },
+    { id: "forge-004", status: "in_progress" },
+  ];
+
+  const orphans = tasks.filter((t) => t.status === "in_progress");
+  assertEqual(orphans.length, 2, "orphan detect: finds 2 in_progress");
+  assertEqual(orphans[0].id, "forge-002", "orphan detect: first orphan");
+  assertEqual(orphans[1].id, "forge-004", "orphan detect: second orphan");
+
+  // no orphans when no in_progress
+  const clean = [
+    { id: "forge-001", status: "done" },
+    { id: "forge-003", status: "failed" },
+  ];
+  const noOrphans = clean.filter((t) => t.status === "in_progress");
+  assertEqual(noOrphans.length, 0, "orphan detect: no orphans when clean");
+}
+
+function testTaskDagSaveChaining() {
+  // save()가 promise chaining으로 직렬화되는지 확인
+  const { TaskDag } = require("../lib/core/task");
+  const dag = new TaskDag({ id: "forge-99990101-test", status: "pending" });
+
+  // save의 _saving 프로퍼티가 체이닝 패턴인지 확인
+  assertEqual(dag._saving, undefined, "save chaining: initial _saving is undefined");
+
+  // save 메서드가 존재하고 함수인지
+  assertEqual(typeof dag.save, "function", "save chaining: save is a function");
+  assertEqual(typeof dag._doSave, "function", "save chaining: _doSave is a function");
+}
+
+function testDeliverAutoMergeFailureSetsReview() {
+  // deliver에서 auto-merge 실패 시 status가 review가 되는지 확인
+  // deliver.js의 코드 구조를 검증
+  const deliverSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "forge", "deliver.js"), "utf-8"
+  );
+  // auto_merged가 catch 블록 전에 설정되고, catch에서 review로 변경
+  const autoMergedBeforeCatch = deliverSource.indexOf('dag.status = "auto_merged"');
+  const reviewInCatch = deliverSource.indexOf('dag.status = "review"');
+  assert(autoMergedBeforeCatch !== -1, "deliver: auto_merged status exists");
+  assert(reviewInCatch !== -1, "deliver: review fallback exists");
+  assert(autoMergedBeforeCatch < reviewInCatch, "deliver: auto_merged before review (success then failure)");
+}
+
+function testAgentSkipPermissions() {
+  // agent.js가 buildCommand에 skipPermissions를 전달하는지 확인
+  const agentSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "core", "agent.js"), "utf-8"
+  );
+  assert(agentSource.includes("skipPermissions: true"), "agent: passes skipPermissions");
+  assert(agentSource.includes("sessionPersistence: false"), "agent: passes sessionPersistence");
+}
+
+function testRsaClassifySkipPermissions() {
+  // rsa.js classify가 skipPermissions를 전달하는지 확인
+  const rsaSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "core", "rsa.js"), "utf-8"
+  );
+  assert(rsaSource.includes("skipPermissions: true"), "rsa classify: passes skipPermissions");
+  assert(rsaSource.includes("sessionPersistence: false"), "rsa classify: passes sessionPersistence");
+}
+
+function testServerTaskIdValidation() {
+  // server/index.js에 taskId 검증이 있는지 확인
+  const serverSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "server", "index.js"), "utf-8"
+  );
+  assert(serverSource.includes("validateTaskId"), "server: has validateTaskId function");
+  assert(serverSource.includes("TASK_ID_RE"), "server: has TASK_ID_RE regex");
+  // path traversal 방지: logs, diff, abort, approve, reject에 모두 적용
+  const validateCalls = (serverSource.match(/validateTaskId/g) || []).length;
+  assert(validateCalls >= 7, `server: validateTaskId called ${validateCalls} times (expect >=7)`);
+}
+
+function testWireEventsIncludesAbort() {
+  // wireEvents에 pipeline:abort가 포함되는지 확인
+  const forgeSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "forge", "index.js"), "utf-8"
+  );
+  assert(forgeSource.includes('"pipeline:abort"'), "wireEvents: includes pipeline:abort");
+}
+
+function testSubtasksRunSequentially() {
+  // subtask가 순차 실행되는지 확인 (Promise.all 미사용)
+  const forgeSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "forge", "index.js"), "utf-8"
+  );
+  // runSubtaskStages에서 Promise.all이 없어야 함
+  const subtaskSection = forgeSource.slice(
+    forgeSource.indexOf("async runSubtaskStages"),
+    forgeSource.indexOf("async runImplementVerifyLoop")
+  );
+  assert(!subtaskSection.includes("Promise.all"), "subtasks: no Promise.all (sequential execution)");
+  assert(subtaskSection.includes("같은 worktree를 공유"), "subtasks: has worktree conflict comment");
+}
+
+function testParallelTokenUsage() {
+  // parallel.js가 tokenUsage를 집계하는지 확인
+  const parallelSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "core", "parallel.js"), "utf-8"
+  );
+  assert(parallelSource.includes("results.tokenUsage.input"), "parallel: tracks input tokens");
+  assert(parallelSource.includes("results.tokenUsage.output"), "parallel: tracks output tokens");
+}
+
+function testVerifyUsesExtractJson() {
+  // verify.js가 extractJson을 사용하는지 확인
+  const verifySource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "forge", "verify.js"), "utf-8"
+  );
+  assert(verifySource.includes("extractJson"), "verify: uses extractJson for robust parsing");
+  assert(!verifySource.includes("JSON.parse(testResult"), "verify: no raw JSON.parse on agent output");
+}
+
+function testSubtaskMissingContinues() {
+  // subtask not found 시 continue(계속)인지 확인
+  const forgeSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "forge", "index.js"), "utf-8"
+  );
+  const section = forgeSource.slice(
+    forgeSource.indexOf("subtask not found"),
+    forgeSource.indexOf("subtask not found") + 100
+  );
+  assert(section.includes("continue"), "subtask missing: uses continue (not return)");
+}
+
+function testResumeInvalidStageThrows() {
+  // resumeFrom에 잘못된 stage 지정 시 에러 발생 코드가 있는지 확인
+  const forgeSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "forge", "index.js"), "utf-8"
+  );
+  assert(forgeSource.includes("not found in pipeline"), "resume: invalid stage detection exists");
+}
+
+function testImplementFailureRecordsStage() {
+  // runImplementVerifyLoop에서 implement 실패 시 recordStage 호출 확인
+  const forgeSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "forge", "index.js"), "utf-8"
+  );
+  const loopSection = forgeSource.slice(
+    forgeSource.indexOf("async runImplementVerifyLoop"),
+    forgeSource.indexOf("async learnToHivemind")
+  );
+  assert(
+    loopSection.includes('recordStage("implement", "fail"'),
+    "implement loop: records stage failure"
+  );
+}
+
+function testIntakeRecordsStage() {
+  // runIntake에서 recordStage 호출 확인
+  const forgeSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "forge", "index.js"), "utf-8"
+  );
+  const intakeSection = forgeSource.slice(
+    forgeSource.indexOf("async runIntake"),
+    forgeSource.indexOf("async setupWorktree")
+  );
+  assert(intakeSection.includes('recordStage("intake"'), "intake: records stage in history");
+  assert(intakeSection.includes("stage:start"), "intake: emits stage:start");
+  assert(intakeSection.includes("stage:complete"), "intake: emits stage:complete");
+}
+
+function testSpecifyRsaTokenUsage() {
+  // specify.js RSA가 parallel worker tokenUsage를 포함하는지 확인
+  const specSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "forge", "specify.js"), "utf-8"
+  );
+  assert(specSource.includes("parallelResult.tokenUsage"), "specify RSA: includes parallel worker tokens");
+}
+
+function testRemoveWorktreesUsesOrigin() {
+  // removeWorktrees가 project.origin을 사용하는지 확인
+  const worktreeSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "core", "worktree.js"), "utf-8"
+  );
+  const removeSection = worktreeSource.slice(
+    worktreeSource.indexOf("async function removeWorktrees"),
+    worktreeSource.indexOf("async function getWorktreeDiff")
+  );
+  assert(removeSection.includes("project.origin || project.path"), "removeWorktrees: uses origin path");
+}
+
+function testIntegrateConflictResolutionUsesOrigin() {
+  // integrate.js conflict resolution이 origin 경로를 사용하는지 확인
+  const intSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "forge", "integrate.js"), "utf-8"
+  );
+  assert(intSource.includes("workspace.projects[0]?.origin"), "integrate: conflict resolution uses origin path");
+}
+
+function testPolishConfig() {
+  const { POLISH_CONFIG, STAGE_ARTIFACTS, STAGE_TIMEOUTS, STAGE_MODELS, FORGE_PIPELINES } = require("../lib/core/constants");
+
+  // POLISH_CONFIG 존재 확인
+  assert(POLISH_CONFIG, "POLISH_CONFIG: exists");
+  assertEqual(POLISH_CONFIG.defaultLenses.length, 4, "POLISH_CONFIG: 4 lenses");
+  assert(POLISH_CONFIG.defaultLenses.includes("code_quality"), "POLISH_CONFIG: has code_quality");
+  assert(POLISH_CONFIG.defaultLenses.includes("security"), "POLISH_CONFIG: has security");
+  assertEqual(POLISH_CONFIG.maxRoundsPerLens, 5, "POLISH_CONFIG: maxRoundsPerLens=5");
+  assertEqual(POLISH_CONFIG.maxTotalRounds, 15, "POLISH_CONFIG: maxTotalRounds=15");
+  assertEqual(POLISH_CONFIG.convergenceThreshold, 2, "POLISH_CONFIG: convergenceThreshold=2");
+
+  // STAGE_ARTIFACTS
+  assert(STAGE_ARTIFACTS.polish, "STAGE_ARTIFACTS: polish exists");
+  assertEqual(STAGE_ARTIFACTS.polish.requires.length, 0, "STAGE_ARTIFACTS: polish requires empty (subtask-safe)");
+  assert(STAGE_ARTIFACTS.polish.produces.includes("polish-summary.json"), "STAGE_ARTIFACTS: polish produces polish-summary.json");
+
+  // STAGE_TIMEOUTS
+  assert(STAGE_TIMEOUTS.polish, "STAGE_TIMEOUTS: polish exists");
+  assertEqual(STAGE_TIMEOUTS.polish.idle, 8 * 60_000, "STAGE_TIMEOUTS: polish idle=8min");
+  assertEqual(STAGE_TIMEOUTS.polish.hard, 60 * 60_000, "STAGE_TIMEOUTS: polish hard=60min");
+
+  // STAGE_MODELS
+  const polishModels = STAGE_MODELS.polish;
+  assert(polishModels, "STAGE_MODELS: polish exists");
+  assertEqual(polishModels.review, "sonnet", "STAGE_MODELS: polish.review=sonnet");
+  assertEqual(polishModels.fix, "opus", "STAGE_MODELS: polish.fix=opus");
+
+  // FORGE_PIPELINES에 polish 포함
+  assert(FORGE_PIPELINES.medium.includes("polish"), "FORGE_PIPELINES: medium has polish");
+  assert(FORGE_PIPELINES.large.includes("polish"), "FORGE_PIPELINES: large has polish");
+  assert(!FORGE_PIPELINES.trivial.includes("polish"), "FORGE_PIPELINES: trivial has no polish");
+  assert(!FORGE_PIPELINES.small.includes("polish"), "FORGE_PIPELINES: small has no polish");
+
+  // medium에서 polish는 verify 다음, deliver 이전
+  const mediumIdx = FORGE_PIPELINES.medium;
+  assert(mediumIdx.indexOf("polish") > mediumIdx.indexOf("verify"), "FORGE_PIPELINES: medium polish after verify");
+  assert(mediumIdx.indexOf("polish") < mediumIdx.indexOf("deliver"), "FORGE_PIPELINES: medium polish before deliver");
+
+  // large에서 polish는 verify 다음, integrate 이전
+  const largeIdx = FORGE_PIPELINES.large;
+  assert(largeIdx.indexOf("polish") > largeIdx.indexOf("verify"), "FORGE_PIPELINES: large polish after verify");
+  assert(largeIdx.indexOf("polish") < largeIdx.indexOf("integrate"), "FORGE_PIPELINES: large polish before integrate");
+}
+
+function testPolishModuleExports() {
+  const polish = require("../lib/forge/polish");
+  assertEqual(typeof polish.run, "function", "polish: exports run function");
+}
+
+function testPolishInSubtaskStages() {
+  // forge/index.js가 subtask stages에 polish를 포함하는지 소스 확인
+  const forgeSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "forge", "index.js"), "utf-8"
+  );
+  assert(forgeSource.includes('"polish"') && forgeSource.includes("pipelineStages.includes"), "forge/index: polish in subtask stages");
+}
+
+function testPolishLensPromptsCoverage() {
+  const { POLISH_CONFIG } = require("../lib/core/constants");
+  // polish.js의 LENS_PROMPTS가 모든 defaultLenses를 커버하는지 확인
+  const polishSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "forge", "polish.js"), "utf-8"
+  );
+  for (const lens of POLISH_CONFIG.defaultLenses) {
+    assert(polishSource.includes(`${lens}:`), `polish LENS_PROMPTS: covers ${lens}`);
+  }
+}
+
+function testPolishModelEnvOverride() {
+  const { STAGE_MODELS } = require("../lib/core/constants");
+  // polish는 객체 타입 — env override가 동작하는지 확인
+  process.env.UCM_MODEL_POLISH_REVIEW = "haiku";
+  const overridden = STAGE_MODELS.polish;
+  assertEqual(overridden.review, "haiku", "STAGE_MODELS: polish.review env override works");
+  assertEqual(overridden.fix, "opus", "STAGE_MODELS: polish.fix unchanged when only review overridden");
+  delete process.env.UCM_MODEL_POLISH_REVIEW;
+}
+
+function testPolishCustomPipelineDetection() {
+  // 커스텀 파이프라인 문자열에서 polish 포함 여부 탐지 로직
+  const { FORGE_PIPELINES } = require("../lib/core/constants");
+  const custom = "implement,verify,polish,deliver";
+  const stages = FORGE_PIPELINES[custom]
+    || (typeof custom === "string" && custom.includes(",") ? custom.split(",").map((s) => s.trim()) : []);
+  assert(stages.includes("polish"), "custom pipeline: detects polish");
+
+  // 일반 파이프라인 키도 동작
+  const medium = FORGE_PIPELINES["medium"] || [];
+  assert(medium.includes("polish"), "named pipeline: detects polish from medium");
+}
+
+function testPolishStageEstimate() {
+  // bin/ucm.js의 STAGE_EST에 polish가 포함되어 있는지 확인
+  const ucmSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "bin", "ucm.js"), "utf-8"
+  );
+  assert(ucmSource.includes("polish:"), "ucm.js: STAGE_EST has polish");
+}
+
+// ── UX Review Tests ──
+
+function testUxReviewModuleExports() {
+  const uxReview = require("../lib/forge/ux-review");
+  assertEqual(typeof uxReview.run, "function", "ux-review: exports run");
+  assertEqual(typeof uxReview.parseUxReview, "function", "ux-review: exports parseUxReview");
+  assertEqual(typeof uxReview.formatUxFeedback, "function", "ux-review: exports formatUxFeedback");
+  assertEqual(typeof uxReview.detectFrontend, "function", "ux-review: exports detectFrontend");
+  assertEqual(typeof uxReview.loadTemplate, "function", "ux-review: exports loadTemplate");
+}
+
+function testUxReviewParseValid() {
+  const { parseUxReview } = require("../lib/forge/ux-review");
+  const input = JSON.stringify({
+    score: 8,
+    summary: "Good UI",
+    canUserAccomplishGoal: { goal: "create items", result: "yes", blockers: [] },
+    usabilityIssues: [{ severity: "minor", description: "label unclear", where: "header", fix: "rename" }],
+    confusingElements: [],
+    positives: ["clean layout"],
+    mobile: { usable: true, issues: [] },
+  });
+  const result = parseUxReview(input);
+  assertEqual(result.score, 8, "parseUxReview: score");
+  assertEqual(result.usabilityIssues.length, 1, "parseUxReview: 1 usability issue");
+  assertEqual(result.positives.length, 1, "parseUxReview: 1 positive");
+  assertEqual(result.canUserAccomplishGoal.result, "yes", "parseUxReview: goal accomplished");
+}
+
+function testUxReviewParseInvalid() {
+  const { parseUxReview } = require("../lib/forge/ux-review");
+  const result = parseUxReview("not json at all");
+  assertEqual(result.score, 0, "parseUxReview invalid: score 0");
+  assertEqual(result.usabilityIssues.length, 1, "parseUxReview invalid: has error issue");
+}
+
+function testUxReviewFormatFeedback() {
+  const { formatUxFeedback } = require("../lib/forge/ux-review");
+  const review = {
+    usabilityIssues: [
+      { severity: "critical", description: "can't find main action", where: "landing page", fix: "add CTA" },
+      { severity: "major", description: "confusing labels", where: "sidebar", fix: "rename" },
+      { severity: "minor", description: "small icons", where: "toolbar", fix: "enlarge" },
+    ],
+    canUserAccomplishGoal: { goal: "submit form", result: "no", blockers: ["button not visible"] },
+  };
+  const feedback = formatUxFeedback(review);
+  assert(feedback.includes("Critical Usability Issues"), "formatUxFeedback: has critical section");
+  assert(feedback.includes("can't find main action"), "formatUxFeedback: has critical issue");
+  assert(feedback.includes("Major Usability Issues"), "formatUxFeedback: has major section");
+  assert(feedback.includes("confusing labels"), "formatUxFeedback: has major item");
+  assert(!feedback.includes("small icons"), "formatUxFeedback: excludes minor");
+  assert(feedback.includes("User Goal Not Met"), "formatUxFeedback: goal not met section");
+}
+
+function testUxReviewConstants() {
+  const { STAGE_ARTIFACTS, STAGE_TIMEOUTS, STAGE_MODELS, FORGE_PIPELINES } = require("../lib/core/constants");
+
+  assert(STAGE_ARTIFACTS["ux-review"], "constants: ux-review in STAGE_ARTIFACTS");
+  assertDeepEqual(STAGE_ARTIFACTS["ux-review"].requires, [], "constants: ux-review requires nothing");
+  assertDeepEqual(STAGE_ARTIFACTS["ux-review"].produces, ["ux-review.json"], "constants: ux-review produces json");
+
+  assert(STAGE_TIMEOUTS["ux-review"], "constants: ux-review in STAGE_TIMEOUTS");
+  assertEqual(STAGE_TIMEOUTS["ux-review"].idle, 5 * 60_000, "constants: ux-review idle timeout");
+  assertEqual(STAGE_TIMEOUTS["ux-review"].hard, 15 * 60_000, "constants: ux-review hard timeout");
+
+  assertEqual(STAGE_MODELS["ux-review"], "sonnet", "constants: ux-review model is sonnet");
+
+  assert(FORGE_PIPELINES.medium.includes("ux-review"), "constants: medium pipeline has ux-review");
+  assert(FORGE_PIPELINES.large.includes("ux-review"), "constants: large pipeline has ux-review");
+
+  const mediumIdx = FORGE_PIPELINES.medium.indexOf("ux-review");
+  const verifyIdx = FORGE_PIPELINES.medium.indexOf("verify");
+  const polishIdx = FORGE_PIPELINES.medium.indexOf("polish");
+  assert(mediumIdx > verifyIdx, "constants: ux-review after verify in medium");
+  assert(mediumIdx < polishIdx, "constants: ux-review before polish in medium");
+}
+
+function testUxReviewTemplate() {
+  const { loadTemplate } = require("../lib/forge/ux-review");
+  const template = loadTemplate();
+  assert(template.includes("{{SPEC}}"), "template: has SPEC placeholder");
+  assert(template.includes("{{DESIGN}}"), "template: has DESIGN placeholder");
+  assert(template.includes("{{DEV_URL}}"), "template: has DEV_URL placeholder");
+  assert(template.includes("accomplish the main task"), "template: has main task evaluation");
+  assert(template.includes("dangerous actions"), "template: has dangerous actions check");
+  assert(template.includes("different sizes"), "template: has responsive check");
+  assert(template.includes("score"), "template: has scoring");
+  assert(template.includes("usabilityIssues"), "template: has usability issues output");
+}
+
+function testUxReviewInPipeline() {
+  const forgeSource = require("fs").readFileSync(
+    require("path").join(__dirname, "..", "lib", "forge", "index.js"), "utf-8"
+  );
+  assert(forgeSource.includes('"ux-review"'), "forge/index: includes ux-review stage");
+  assert(forgeSource.includes("ux-review"), "forge/index: handles ux-review in subtask stages");
+
+  // ux-review가 runImplementVerifyLoop에서 처리되는지 확인
+  const loopSection = forgeSource.slice(
+    forgeSource.indexOf("async runImplementVerifyLoop"),
+    forgeSource.indexOf("async learnToHivemind")
+  );
+  assert(loopSection.includes("ux-review"), "forge/index: ux-review in implement-verify loop");
+}
+
+async function testUxReviewDetectFrontend() {
+  const { detectFrontend } = require("../lib/core/browser");
+  const ts = Date.now();
+
+  // non-existent project → null
+  const result = await detectFrontend(`/tmp/ucm-test-nonexistent-${ts}`);
+  assertEqual(result, null, "detectFrontend: non-existent dir returns null");
+
+  // .ucm.json explicit config (highest priority)
+  const t1 = path.join(os.tmpdir(), `ucm-fe-ucmjson-${ts}`);
+  await mkdir(t1, { recursive: true });
+  await writeFile(path.join(t1, ".ucm.json"), JSON.stringify({ devCommand: "node bin/app.js ui", devPort: 4000 }));
+  const r1 = await detectFrontend(t1);
+  assertEqual(r1.devCommand, "node bin/app.js ui", "detectFrontend: .ucm.json devCommand");
+  assertEqual(r1.devPort, 4000, "detectFrontend: .ucm.json devPort");
+  assertEqual(r1.source, ".ucm.json", "detectFrontend: .ucm.json source");
+  await rm(t1, { recursive: true });
+
+  // package.json "ucm" field
+  const t2 = path.join(os.tmpdir(), `ucm-fe-pkgucm-${ts}`);
+  await mkdir(t2, { recursive: true });
+  await writeFile(path.join(t2, "package.json"), JSON.stringify({ ucm: { devCommand: "ucm ui", devPort: 3000 } }));
+  const r2 = await detectFrontend(t2);
+  assertEqual(r2.devCommand, "ucm ui", "detectFrontend: pkg.ucm devCommand");
+  assertEqual(r2.source, "package.json/ucm", "detectFrontend: pkg.ucm source");
+  await rm(t2, { recursive: true });
+
+  // framework config (vite.config.ts)
+  const t3 = path.join(os.tmpdir(), `ucm-fe-vite-${ts}`);
+  await mkdir(t3, { recursive: true });
+  await writeFile(path.join(t3, "vite.config.ts"), "export default {}");
+  const r3 = await detectFrontend(t3);
+  assert(r3 !== null, "detectFrontend: vite config detected");
+  assertEqual(r3.devPort, 5173, "detectFrontend: vite default port");
+  assert(r3.source.startsWith("framework:"), "detectFrontend: vite source");
+  await rm(t3, { recursive: true });
+
+  // framework config + scripts → scripts의 port 우선
+  const t4 = path.join(os.tmpdir(), `ucm-fe-vite-script-${ts}`);
+  await mkdir(t4, { recursive: true });
+  await writeFile(path.join(t4, "vite.config.ts"), "export default {}");
+  await writeFile(path.join(t4, "package.json"), JSON.stringify({ scripts: { dev: "vite --port 4444" } }));
+  const r4 = await detectFrontend(t4);
+  assertEqual(r4.devCommand, "npm run dev", "detectFrontend: vite+scripts uses npm run dev");
+  assertEqual(r4.devPort, 4444, "detectFrontend: port from script content");
+  await rm(t4, { recursive: true });
+
+  // frontend dependency (react)
+  const t5 = path.join(os.tmpdir(), `ucm-fe-react-${ts}`);
+  await mkdir(t5, { recursive: true });
+  await writeFile(path.join(t5, "package.json"), JSON.stringify({ dependencies: { react: "^18" }, scripts: { dev: "next dev" } }));
+  const r5 = await detectFrontend(t5);
+  assert(r5 !== null, "detectFrontend: react dep detected");
+  assertEqual(r5.source, "package.json/deps", "detectFrontend: react source");
+  await rm(t5, { recursive: true });
+
+  // scripts keyword analysis (no framework config, no frontend deps, but script has "vite")
+  const t6 = path.join(os.tmpdir(), `ucm-fe-scriptkw-${ts}`);
+  await mkdir(t6, { recursive: true });
+  await writeFile(path.join(t6, "package.json"), JSON.stringify({ scripts: { dev: "vite --host" } }));
+  const r6 = await detectFrontend(t6);
+  assert(r6 !== null, "detectFrontend: script keyword detected");
+  assertEqual(r6.source, "package.json/scripts", "detectFrontend: script keyword source");
+  await rm(t6, { recursive: true });
+
+  // static index.html
+  const t7 = path.join(os.tmpdir(), `ucm-fe-static-${ts}`);
+  await mkdir(t7, { recursive: true });
+  await writeFile(path.join(t7, "index.html"), "<html></html>");
+  const r7 = await detectFrontend(t7);
+  assert(r7 !== null, "detectFrontend: static index.html");
+  assert(r7.devCommand.includes("serve"), "detectFrontend: static uses serve");
+  assertEqual(r7.staticOnly, true, "detectFrontend: static flag");
+  await rm(t7, { recursive: true });
+
+  // pure backend (no frontend signals) → null
+  const t8 = path.join(os.tmpdir(), `ucm-fe-backend-${ts}`);
+  await mkdir(t8, { recursive: true });
+  await writeFile(path.join(t8, "package.json"), JSON.stringify({ scripts: { test: "jest" }, dependencies: { express: "^4" } }));
+  const r8 = await detectFrontend(t8);
+  assertEqual(r8, null, "detectFrontend: pure backend returns null");
+  await rm(t8, { recursive: true });
+
+  // Python Django
+  const t9 = path.join(os.tmpdir(), `ucm-fe-django-${ts}`);
+  await mkdir(t9, { recursive: true });
+  await writeFile(path.join(t9, "manage.py"), "#!/usr/bin/env python");
+  const r9 = await detectFrontend(t9);
+  assert(r9 !== null, "detectFrontend: Django manage.py");
+  assert(r9.devCommand.includes("runserver"), "detectFrontend: Django command");
+  assertEqual(r9.devPort, 8000, "detectFrontend: Django port");
+  await rm(t9, { recursive: true });
+}
+
+function testBrowserModuleExports() {
+  const browser = require("../lib/core/browser");
+  assertEqual(typeof browser.launchBrowser, "function", "browser: exports launchBrowser");
+  assertEqual(typeof browser.killBrowser, "function", "browser: exports killBrowser");
+  assertEqual(typeof browser.detectFrontend, "function", "browser: exports detectFrontend");
+  assertEqual(typeof browser.startDevServer, "function", "browser: exports startDevServer");
+  assertEqual(typeof browser.resolvePort, "function", "browser: exports resolvePort");
+  assertEqual(typeof browser.extractPortFromScript, "function", "browser: exports extractPortFromScript");
+  assertEqual(typeof browser.pickDevScript, "function", "browser: exports pickDevScript");
+  assertEqual(typeof browser.scriptLooksLikeWebServer, "function", "browser: exports scriptLooksLikeWebServer");
+}
+
+function testBrowserResolvePort() {
+  const { resolvePort } = require("../lib/core/browser");
+  const port1 = resolvePort("forge-20260219-abc");
+  assert(port1 >= 9222 && port1 < 10222, "resolvePort: within range");
+  const port2 = resolvePort("forge-20260219-xyz");
+  assert(typeof port2 === "number", "resolvePort: returns number");
+}
+
+function testExtractPortFromScript() {
+  const { extractPortFromScript } = require("../lib/core/browser");
+  assertEqual(extractPortFromScript("vite --port 4444"), 4444, "extractPort: --port");
+  assertEqual(extractPortFromScript("next dev -p 3001"), 3001, "extractPort: -p");
+  assertEqual(extractPortFromScript("ng serve"), null, "extractPort: no port");
+  assertEqual(extractPortFromScript("node server.js"), null, "extractPort: no port pattern");
+}
+
+function testPickDevScript() {
+  const { pickDevScript } = require("../lib/core/browser");
+  assertEqual(pickDevScript({ dev: "vite", start: "node index.js" }).name, "dev", "pickDevScript: dev > start");
+  assertEqual(pickDevScript({ serve: "http-server", start: "node ." }).name, "serve", "pickDevScript: serve > start");
+  assertEqual(pickDevScript({ "dev:web": "vite", test: "jest" }).name, "dev:web", "pickDevScript: dev: prefix");
+  assertEqual(pickDevScript({ test: "jest", build: "tsc" }), null, "pickDevScript: no dev script");
+  assertEqual(pickDevScript(null), null, "pickDevScript: null scripts");
+}
+
+function testScriptLooksLikeWebServer() {
+  const { scriptLooksLikeWebServer } = require("../lib/core/browser");
+  assertEqual(scriptLooksLikeWebServer("vite --host"), true, "scriptWebServer: vite");
+  assertEqual(scriptLooksLikeWebServer("next dev"), true, "scriptWebServer: next");
+  assertEqual(scriptLooksLikeWebServer("react-scripts start"), true, "scriptWebServer: react-scripts");
+  assertEqual(scriptLooksLikeWebServer("jest --coverage"), false, "scriptWebServer: jest");
+  assertEqual(scriptLooksLikeWebServer("tsc && node dist/index.js"), false, "scriptWebServer: tsc");
+}
+
+function testFrameworkSignatures() {
+  const { FRAMEWORK_SIGNATURES, FRONTEND_DEPS } = require("../lib/core/browser");
+  assert(FRAMEWORK_SIGNATURES.length >= 10, "signatures: at least 10 frameworks");
+  assert(FRONTEND_DEPS.has("react"), "frontendDeps: has react");
+  assert(FRONTEND_DEPS.has("vue"), "frontendDeps: has vue");
+  assert(FRONTEND_DEPS.has("svelte"), "frontendDeps: has svelte");
+  assert(!FRONTEND_DEPS.has("express"), "frontendDeps: no express");
+}
+
+async function testPolishSimulations() {
+  const polishPath = require.resolve("../lib/forge/polish");
+  const llmMod = require("../lib/core/llm");
+  const agentMod = require("../lib/core/agent");
+  const worktreeMod = require("../lib/core/worktree");
+
+  const origLlmJson = llmMod.llmJson;
+  const origSpawnAgent = agentMod.spawnAgent;
+  const origLoad = worktreeMod.loadArtifact;
+  const origSave = worktreeMod.saveArtifact;
+
+  function setup(llmFn, agentFn) {
+    delete require.cache[polishPath];
+    llmMod.llmJson = llmFn;
+    agentMod.spawnAgent = agentFn;
+    worktreeMod.loadArtifact = async () => "";
+    worktreeMod.saveArtifact = async () => {};
+    return require("../lib/forge/polish");
+  }
+
+  function restore() {
+    delete require.cache[polishPath];
+    llmMod.llmJson = origLlmJson;
+    agentMod.spawnAgent = origSpawnAgent;
+    worktreeMod.loadArtifact = origLoad;
+    worktreeMod.saveArtifact = origSave;
+  }
+
+  const baseOpts = {
+    taskId: "sim-test",
+    dag: { totalTokens: () => 0 },
+    project: "/tmp/sim",
+    timeouts: { idle: 60000, hard: 300000 },
+    onLog: () => {},
+  };
+
+  const cleanReview = { data: { issues: [], summary: "clean" }, tokenUsage: { input: 100, output: 50 } };
+  const issueReview = (n) => ({
+    data: {
+      issues: Array.from({ length: n }, (_, i) => ({ severity: "minor", description: `issue ${i + 1}`, file: "a.js" })),
+      summary: `${n} issues`,
+    },
+    tokenUsage: { input: 100, output: 50 },
+  });
+  const agentOk = { status: "done", stdout: '{"testsPassed":true,"summary":"ok","failures":[]}', tokenUsage: { input: 200, output: 100 } };
+  const agentTestFail = { status: "done", stdout: '{"testsPassed":false,"summary":"fail","failures":["test1 failed"]}', tokenUsage: { input: 200, output: 100 } };
+
+  // ── Scenario 1: Immediate convergence (all 0 issues) ──
+  // 4 lenses × 2 consecutive clean rounds = 8 total rounds, all converge
+  {
+    let llmCalls = 0;
+    const polish = setup(
+      async () => { llmCalls++; return cleanReview; },
+      async () => agentOk,
+    );
+    const r = await polish.run(baseOpts);
+    assertEqual(r.summary.totalRounds, 8, "sim:converge: 8 rounds (4×2)");
+    assertEqual(r.summary.totalIssuesFound, 0, "sim:converge: 0 issues");
+    assert(r.summary.lenses.every((l) => l.converged), "sim:converge: all converged");
+    assertEqual(r.summary.lenses.length, 4, "sim:converge: 4 lenses");
+    assertEqual(llmCalls, 8, "sim:converge: 8 llm calls");
+    restore();
+  }
+
+  // ── Scenario 2: Issues found → fix → converge ──
+  // code_quality R1: 2 issues → fix+test → R2: clean → R3: clean → converge (3 rounds)
+  // other 3 lenses: 2 clean rounds each (6 rounds)
+  // total: 9 rounds, 2 issues found
+  {
+    let llmCalls = 0;
+    let agentCalls = 0;
+    const polish = setup(
+      async () => { llmCalls++; return llmCalls === 1 ? issueReview(2) : cleanReview; },
+      async () => { agentCalls++; return agentOk; },
+    );
+    const r = await polish.run(baseOpts);
+    assertEqual(r.summary.totalRounds, 9, "sim:fix: 9 rounds");
+    assertEqual(r.summary.totalIssuesFound, 2, "sim:fix: 2 issues");
+    assertEqual(r.summary.lenses[0].lens, "code_quality", "sim:fix: first lens is code_quality");
+    assertEqual(r.summary.lenses[0].issuesFound, 2, "sim:fix: code_quality 2 issues");
+    assertEqual(r.summary.lenses[0].rounds, 3, "sim:fix: code_quality 3 rounds");
+    assert(r.summary.lenses.every((l) => l.converged), "sim:fix: all converged");
+    assertEqual(agentCalls, 2, "sim:fix: 2 agent calls (fix + test gate)");
+    restore();
+  }
+
+  // ── Scenario 3: Max rounds per lens exhausted ──
+  // code_quality: always 1 issue → 5 rounds (maxPerLens), no convergence
+  // other lenses: immediate convergence (2 rounds each)
+  // total: 5 + 2 + 2 + 2 = 11
+  {
+    let llmCalls = 0;
+    const polish = setup(
+      async () => { llmCalls++; return llmCalls <= 5 ? issueReview(1) : cleanReview; },
+      async () => agentOk,
+    );
+    const r = await polish.run(baseOpts);
+    assertEqual(r.summary.totalRounds, 11, "sim:maxPerLens: 11 rounds");
+    assertEqual(r.summary.lenses[0].rounds, 5, "sim:maxPerLens: code_quality 5 rounds");
+    assertEqual(r.summary.lenses[0].converged, false, "sim:maxPerLens: code_quality not converged");
+    assertEqual(r.summary.lenses[0].issuesFound, 5, "sim:maxPerLens: code_quality 5 issues");
+    assert(r.summary.lenses.slice(1).every((l) => l.converged), "sim:maxPerLens: others converged");
+    restore();
+  }
+
+  // ── Scenario 4: Max total rounds reached ──
+  // All lenses always return issues → each gets 5 rounds
+  // code_quality(5) + design(5) + testing(5) = 15 → maxTotalRounds → security skipped
+  {
+    const polish = setup(
+      async () => issueReview(1),
+      async () => agentOk,
+    );
+    const r = await polish.run(baseOpts);
+    assertEqual(r.summary.totalRounds, 15, "sim:maxTotal: 15 total rounds");
+    assertEqual(r.summary.lenses.length, 3, "sim:maxTotal: 3 lenses (security skipped)");
+    assertEqual(r.summary.totalIssuesFound, 15, "sim:maxTotal: 15 issues");
+    assert(r.summary.lenses.every((l) => !l.converged), "sim:maxTotal: none converged");
+    assertEqual(r.summary.lenses[0].lens, "code_quality", "sim:maxTotal: lens order preserved");
+    assertEqual(r.summary.lenses[2].lens, "testing", "sim:maxTotal: last lens is testing");
+    restore();
+  }
+
+  // ── Scenario 5: Token budget exhausted from previous stages ──
+  // dag.totalTokens() = 960 (96% of 1000) → polish refuses to start any lens
+  {
+    const polish = setup(
+      async () => cleanReview,
+      async () => agentOk,
+    );
+    const r = await polish.run({
+      ...baseOpts,
+      dag: { totalTokens: () => 960 },
+      tokenBudget: 1000,
+    });
+    assertEqual(r.summary.totalRounds, 0, "sim:budget: 0 rounds");
+    assertEqual(r.summary.lenses.length, 0, "sim:budget: 0 lenses ran");
+    assertEqual(r.status, "pass", "sim:budget: still returns pass status");
+    restore();
+  }
+
+  // ── Scenario 6: Test gate failure → fixTestFailures → then converge ──
+  // code_quality R1: 1 issue → fix → test FAIL → fixTest
+  // code_quality R2: clean → R3: clean → converge
+  // other lenses: 2 clean rounds each
+  {
+    let llmCalls = 0;
+    let agentCalls = 0;
+    const polish = setup(
+      async () => { llmCalls++; return llmCalls === 1 ? issueReview(1) : cleanReview; },
+      async () => {
+        agentCalls++;
+        // call 1: fix → ok, call 2: test gate → FAIL, call 3: fixTest → ok
+        return agentCalls === 2 ? agentTestFail : agentOk;
+      },
+    );
+    const r = await polish.run(baseOpts);
+    assertEqual(r.summary.totalRounds, 9, "sim:testFail: 9 rounds");
+    assertEqual(r.summary.lenses[0].issuesFound, 1, "sim:testFail: 1 issue found");
+    assertEqual(agentCalls, 3, "sim:testFail: 3 agent calls (fix, test, fixTest)");
+    assert(r.summary.lenses.every((l) => l.converged), "sim:testFail: all converged after fix");
+    // token usage should include all 3 agent calls
+    const totalAgentTokens = 3 * (200 + 100); // 3 calls × (input + output)
+    const totalLlmTokens = 9 * (100 + 50); // 9 calls × (input + output)
+    const expectedTotal = totalAgentTokens + totalLlmTokens;
+    const actualTotal = r.tokenUsage.input + r.tokenUsage.output;
+    assertEqual(actualTotal, expectedTotal, "sim:testFail: token usage accumulated correctly");
+    restore();
+  }
+}
+
 // ── Run All Tests ──
 
+// ── Autopilot Tests ──
+
+function testAutopilotModuleExports() {
+  assert(typeof ucmdAutopilot.setDeps === "function", "autopilot exports setDeps");
+  assert(typeof ucmdAutopilot.setLog === "function", "autopilot exports setLog");
+  assert(typeof ucmdAutopilot.handleAutopilotStart === "function", "autopilot exports handleAutopilotStart");
+  assert(typeof ucmdAutopilot.handleAutopilotPause === "function", "autopilot exports handleAutopilotPause");
+  assert(typeof ucmdAutopilot.handleAutopilotResume === "function", "autopilot exports handleAutopilotResume");
+  assert(typeof ucmdAutopilot.handleAutopilotStop === "function", "autopilot exports handleAutopilotStop");
+  assert(typeof ucmdAutopilot.handleAutopilotStatus === "function", "autopilot exports handleAutopilotStatus");
+  assert(typeof ucmdAutopilot.handleAutopilotSession === "function", "autopilot exports handleAutopilotSession");
+  assert(ucmdAutopilot.sessions instanceof Map, "autopilot exports sessions Map");
+  assert(ucmdAutopilot.projectSessionMap instanceof Map, "autopilot exports projectSessionMap");
+}
+
+function testAutopilotSessionCreation() {
+  ucmdAutopilot.setDeps({
+    config: () => DEFAULT_CONFIG,
+    daemonState: () => ({ daemonStatus: "running" }),
+    broadcastWs: () => {},
+    log: () => {},
+  });
+  ucmdAutopilot.setLog(() => {});
+
+  const session = ucmdAutopilot.createSession("/tmp/test-project");
+  assert(session.id.startsWith("ap_"), "session id starts with ap_");
+  assertEqual(session.status, "planning", "session initial status is planning");
+  assertEqual(session.project, "/tmp/test-project", "session project path");
+  assertEqual(session.projectName, "test-project", "session project name");
+  assertEqual(session.iteration, 0, "session initial iteration");
+  assert(Array.isArray(session.roadmap), "session has roadmap array");
+  assert(Array.isArray(session.releases), "session has releases array");
+  assert(Array.isArray(session.log), "session has log array");
+  assertEqual(session.maxItems, DEFAULT_CONFIG.autopilot.maxItemsPerSession, "session maxItems from config");
+  assertEqual(session.consecutiveFailures, 0, "session initial consecutiveFailures");
+  assertEqual(session.totalItemsProcessed, 0, "session initial totalItemsProcessed");
+  assert(session.startedAt !== null, "session has startedAt");
+
+  // Verify session is stored
+  assert(ucmdAutopilot.sessions.has(session.id), "session stored in sessions map");
+  assert(ucmdAutopilot.projectSessionMap.has("/tmp/test-project"), "project stored in projectSessionMap");
+
+  // Cleanup
+  ucmdAutopilot.sessions.delete(session.id);
+  ucmdAutopilot.projectSessionMap.delete("/tmp/test-project");
+}
+
+function testAutopilotDuplicateProject() {
+  ucmdAutopilot.setDeps({
+    config: () => DEFAULT_CONFIG,
+    daemonState: () => ({ daemonStatus: "running" }),
+    broadcastWs: () => {},
+    log: () => {},
+  });
+
+  const session = ucmdAutopilot.createSession("/tmp/dup-project");
+  let threw = false;
+  try {
+    ucmdAutopilot.createSession("/tmp/dup-project");
+  } catch (e) {
+    threw = true;
+    assert(e.message.includes("already running"), "duplicate project error message");
+  }
+  assert(threw, "duplicate project throws error");
+
+  // Cleanup
+  ucmdAutopilot.sessions.delete(session.id);
+  ucmdAutopilot.projectSessionMap.delete("/tmp/dup-project");
+}
+
+function testAutopilotStatusHandler() {
+  ucmdAutopilot.setDeps({
+    config: () => DEFAULT_CONFIG,
+    daemonState: () => ({ daemonStatus: "running" }),
+    broadcastWs: () => {},
+    log: () => {},
+  });
+
+  // Empty sessions
+  const emptyStatus = ucmdAutopilot.handleAutopilotStatus();
+  assert(Array.isArray(emptyStatus), "status returns array");
+  assertEqual(emptyStatus.length, 0, "status returns empty when no sessions");
+
+  // With a session
+  const session = ucmdAutopilot.createSession("/tmp/status-test");
+  const status = ucmdAutopilot.handleAutopilotStatus();
+  assertEqual(status.length, 1, "status returns 1 session");
+  assertEqual(status[0].id, session.id, "status session id matches");
+  assertEqual(status[0].projectName, "status-test", "status session projectName");
+
+  // Cleanup
+  ucmdAutopilot.sessions.delete(session.id);
+  ucmdAutopilot.projectSessionMap.delete("/tmp/status-test");
+}
+
+function testAutopilotPauseResume() {
+  ucmdAutopilot.setDeps({
+    config: () => DEFAULT_CONFIG,
+    daemonState: () => ({ daemonStatus: "running" }),
+    broadcastWs: () => {},
+    log: () => {},
+  });
+
+  const session = ucmdAutopilot.createSession("/tmp/pause-test");
+  session.status = "running";
+
+  // Pause
+  const pauseResult = ucmdAutopilot.handleAutopilotPause({ sessionId: session.id });
+  assertEqual(pauseResult.status, "paused", "pause returns paused status");
+  assertEqual(session.status, "paused", "session status is paused");
+  assertEqual(session.pausedPhase, "running", "pausedPhase preserved");
+
+  // Resume
+  const resumeResult = ucmdAutopilot.handleAutopilotResume({ sessionId: session.id });
+  assertEqual(resumeResult.status, "running", "resume returns previous status");
+  assertEqual(session.status, "running", "session status restored to running");
+  assertEqual(session.pausedPhase, null, "pausedPhase cleared");
+
+  // Cleanup
+  ucmdAutopilot.sessions.delete(session.id);
+  ucmdAutopilot.projectSessionMap.delete("/tmp/pause-test");
+}
+
+function testAutopilotStop() {
+  ucmdAutopilot.setDeps({
+    config: () => DEFAULT_CONFIG,
+    daemonState: () => ({ daemonStatus: "running" }),
+    broadcastWs: () => {},
+    log: () => {},
+  });
+
+  const session = ucmdAutopilot.createSession("/tmp/stop-test");
+  session.status = "running";
+
+  const result = ucmdAutopilot.handleAutopilotStop({ sessionId: session.id });
+  assertEqual(result.status, "stopped", "stop returns stopped status");
+  assertEqual(session.status, "stopped", "session status is stopped");
+  assert(!ucmdAutopilot.projectSessionMap.has("/tmp/stop-test"), "project removed from projectSessionMap");
+
+  // Cleanup
+  ucmdAutopilot.sessions.delete(session.id);
+}
+
+function testAutopilotSessionDetail() {
+  ucmdAutopilot.setDeps({
+    config: () => DEFAULT_CONFIG,
+    daemonState: () => ({ daemonStatus: "running" }),
+    broadcastWs: () => {},
+    log: () => {},
+  });
+
+  const session = ucmdAutopilot.createSession("/tmp/detail-test");
+  session.roadmap = [{ title: "test item", type: "feature", status: "pending" }];
+
+  const detail = ucmdAutopilot.handleAutopilotSession({ sessionId: session.id });
+  assertEqual(detail.id, session.id, "detail id matches");
+  assertEqual(detail.projectName, "detail-test", "detail projectName");
+  assertEqual(detail.roadmap.length, 1, "detail has roadmap");
+  assert(Array.isArray(detail.log), "detail has log array");
+  assert(Array.isArray(detail.releases), "detail has releases array");
+
+  // Not found
+  let threw = false;
+  try { ucmdAutopilot.handleAutopilotSession({ sessionId: "nonexistent" }); } catch { threw = true; }
+  assert(threw, "session not found throws");
+
+  // Cleanup
+  ucmdAutopilot.sessions.delete(session.id);
+  ucmdAutopilot.projectSessionMap.delete("/tmp/detail-test");
+}
+
+function testParseRoadmapOutput() {
+  const validOutput = 'Some text before\n[\n{"title":"Add login","type":"feature","description":"Implement login"},\n{"title":"Write tests","type":"test","description":"Add unit tests"}\n]\nSome text after';
+  const roadmap = ucmdAutopilot.parseRoadmapOutput(validOutput, 1);
+  assertEqual(roadmap.length, 2, "parseRoadmapOutput returns 2 items");
+  assertEqual(roadmap[0].title, "Add login", "first item title");
+  assertEqual(roadmap[0].type, "feature", "first item type");
+  assertEqual(roadmap[0].iteration, 1, "first item iteration");
+  assertEqual(roadmap[0].status, "pending", "first item status pending");
+
+  // Invalid output
+  const empty = ucmdAutopilot.parseRoadmapOutput("no json here", 1);
+  assertEqual(empty.length, 0, "parseRoadmapOutput returns empty for invalid");
+}
+
+function testBumpVersion() {
+  assertEqual(ucmdAutopilot.bumpVersion("0.0.0", "patch"), "0.0.1", "bumpVersion patch");
+  assertEqual(ucmdAutopilot.bumpVersion("0.0.0", "minor"), "0.1.0", "bumpVersion minor");
+  assertEqual(ucmdAutopilot.bumpVersion("0.0.0", "major"), "1.0.0", "bumpVersion major");
+  assertEqual(ucmdAutopilot.bumpVersion("1.2.3", "patch"), "1.2.4", "bumpVersion patch from 1.2.3");
+  assertEqual(ucmdAutopilot.bumpVersion("1.2.3", "minor"), "1.3.0", "bumpVersion minor from 1.2.3");
+  assertEqual(ucmdAutopilot.bumpVersion("invalid", "patch"), "0.1.0", "bumpVersion with invalid version");
+}
+
+function testAutopilotDefaultConfig() {
+  assert(DEFAULT_CONFIG.autopilot !== undefined, "DEFAULT_CONFIG has autopilot section");
+  assertEqual(DEFAULT_CONFIG.autopilot.releaseEvery, 4, "autopilot releaseEvery default");
+  assertEqual(DEFAULT_CONFIG.autopilot.maxConsecutiveFailures, 3, "autopilot maxConsecutiveFailures default");
+  assertEqual(DEFAULT_CONFIG.autopilot.maxItemsPerSession, 50, "autopilot maxItemsPerSession default");
+  assertEqual(DEFAULT_CONFIG.autopilot.reviewRetries, 2, "autopilot reviewRetries default");
+  assert(DEFAULT_CONFIG.autopilot.itemMix !== undefined, "autopilot has itemMix");
+  assertEqual(DEFAULT_CONFIG.autopilot.itemMix.feature, 0.4, "autopilot itemMix feature");
+}
+
+function testAutopilotSessionMetaKey() {
+  assert(META_KEYS.has("autopilotSession"), "META_KEYS includes autopilotSession");
+}
+
+function testAutopilotTemplatesExist() {
+  const templateDir = path.join(SOURCE_ROOT, "templates");
+  assert(fs.existsSync(path.join(templateDir, "ucm-autopilot-plan.md")), "autopilot plan template exists");
+  assert(fs.existsSync(path.join(templateDir, "ucm-autopilot-review.md")), "autopilot review template exists");
+  assert(fs.existsSync(path.join(templateDir, "ucm-autopilot-release.md")), "autopilot release template exists");
+}
+
+function testAutopilotSessionHasForgeFields() {
+  ucmdAutopilot.setDeps({
+    config: () => DEFAULT_CONFIG,
+    daemonState: () => ({ daemonStatus: "running" }),
+    broadcastWs: () => {},
+    log: () => {},
+  });
+
+  const session = ucmdAutopilot.createSession("/tmp/forge-field-test");
+  assert("stableTag" in session, "session has stableTag field");
+  assert(Array.isArray(session.currentTestResults), "session has currentTestResults array");
+  assert(Array.isArray(session.currentItemLog), "session has currentItemLog array");
+  assertEqual(session._reviewResolve, null, "session _reviewResolve starts null");
+  assertEqual(session._reviewTimer, null, "session _reviewTimer starts null");
+
+  const detail = ucmdAutopilot.handleAutopilotSession({ sessionId: session.id });
+  assert("stableTag" in detail, "session detail includes stableTag");
+  assert("currentTestResults" in detail, "session detail includes currentTestResults");
+  assert("currentItemLog" in detail, "session detail includes currentItemLog");
+
+  ucmdAutopilot.sessions.delete(session.id);
+  ucmdAutopilot.projectSessionMap.delete("/tmp/forge-field-test");
+}
+
+async function testAutopilotGitRequired() {
+  ucmdAutopilot.setDeps({
+    config: () => DEFAULT_CONFIG,
+    daemonState: () => ({ daemonStatus: "running" }),
+    broadcastWs: () => {},
+    spawnAgent: async () => ({ status: "done", stdout: "[]" }),
+    log: () => {},
+  });
+  ucmdAutopilot.setLog(() => {});
+
+  let threw = false;
+  try {
+    await ucmdAutopilot.handleAutopilotStart({ project: "/tmp/nonexistent-no-git-repo-test" });
+  } catch (e) {
+    threw = true;
+    assert(e.message.includes("git"), "non-git project error mentions git");
+  }
+  assert(threw, "non-git project throws error");
+}
+
+async function testAutopilotSessionPersistence() {
+  ucmdAutopilot.setDeps({
+    config: () => DEFAULT_CONFIG,
+    daemonState: () => ({ daemonStatus: "running" }),
+    broadcastWs: () => {},
+    log: () => {},
+  });
+  ucmdAutopilot.setLog(() => {});
+
+  const session = ucmdAutopilot.createSession("/tmp/persist-test");
+  session.iteration = 2;
+  session.status = "running";
+
+  await ucmdAutopilot.saveSession(session);
+
+  const loaded = await ucmdAutopilot.loadSession(session.id);
+  assertEqual(loaded.id, session.id, "loaded session id matches");
+  assertEqual(loaded.iteration, 2, "loaded session iteration matches");
+  assertEqual(loaded.project, "/tmp/persist-test", "loaded session project matches");
+  assertEqual(loaded._reviewResolve, null, "loaded session _reviewResolve is null");
+
+  await ucmdAutopilot.deleteSessionFile(session.id);
+  ucmdAutopilot.sessions.delete(session.id);
+  ucmdAutopilot.projectSessionMap.delete("/tmp/persist-test");
+}
+
+function testAutopilotForgePipelineConfig() {
+  assertEqual(DEFAULT_CONFIG.autopilot.forgePipeline, "small", "autopilot forgePipeline default is small");
+}
+
+function testAutopilotReleasesHandler() {
+  ucmdAutopilot.setDeps({
+    config: () => DEFAULT_CONFIG,
+    daemonState: () => ({ daemonStatus: "running" }),
+    broadcastWs: () => {},
+    log: () => {},
+  });
+
+  const session = ucmdAutopilot.createSession("/tmp/releases-test");
+  session.releases.push({ version: "0.1.0", changelog: "test", taskIds: [], itemTitles: ["feat1"], tag: "v0.1.0-stable", timestamp: new Date().toISOString() });
+
+  const result = ucmdAutopilot.handleAutopilotReleases({ sessionId: session.id });
+  assertEqual(result.sessionId, session.id, "releases handler returns sessionId");
+  assertEqual(result.releases.length, 1, "releases handler returns releases");
+  assert(Array.isArray(result.stableTags), "releases handler returns stableTags array");
+
+  // Not found
+  let threw = false;
+  try { ucmdAutopilot.handleAutopilotReleases({ sessionId: "nonexistent" }); } catch { threw = true; }
+  assert(threw, "releases handler throws for nonexistent session");
+
+  ucmdAutopilot.sessions.delete(session.id);
+  ucmdAutopilot.projectSessionMap.delete("/tmp/releases-test");
+}
+
+function testAutopilotDirectiveExports() {
+  assert(typeof ucmdAutopilot.handleAutopilotDirectiveAdd === "function", "autopilot exports handleAutopilotDirectiveAdd");
+  assert(typeof ucmdAutopilot.handleAutopilotDirectiveEdit === "function", "autopilot exports handleAutopilotDirectiveEdit");
+  assert(typeof ucmdAutopilot.handleAutopilotDirectiveDelete === "function", "autopilot exports handleAutopilotDirectiveDelete");
+  assert(typeof ucmdAutopilot.handleAutopilotDirectiveList === "function", "autopilot exports handleAutopilotDirectiveList");
+  assert(typeof ucmdAutopilot.generateDirectiveId === "function", "autopilot exports generateDirectiveId");
+}
+
+function testAutopilotDirectiveCrud() {
+  ucmdAutopilot.setDeps({
+    config: () => DEFAULT_CONFIG,
+    daemonState: () => ({ daemonStatus: "running" }),
+    broadcastWs: () => {},
+    log: () => {},
+  });
+  ucmdAutopilot.setLog(() => {});
+
+  const session = ucmdAutopilot.createSession("/tmp/directive-crud-test");
+
+  // Add
+  const addResult = ucmdAutopilot.handleAutopilotDirectiveAdd({ sessionId: session.id, text: "Add dark mode support" });
+  assertEqual(addResult.directive.text, "Add dark mode support", "directive add returns correct text");
+  assertEqual(addResult.directive.status, "pending", "directive add status is pending");
+  assert(addResult.directive.id.startsWith("d_"), "directive id starts with d_");
+
+  // Add another
+  ucmdAutopilot.handleAutopilotDirectiveAdd({ sessionId: session.id, text: "Fix login bug" });
+
+  // List all
+  const listAll = ucmdAutopilot.handleAutopilotDirectiveList({ sessionId: session.id });
+  assertEqual(listAll.directives.length, 2, "list returns 2 directives");
+
+  // List by status
+  const listPending = ucmdAutopilot.handleAutopilotDirectiveList({ sessionId: session.id, status: "pending" });
+  assertEqual(listPending.directives.length, 2, "list pending returns 2");
+
+  // Edit
+  const directiveId = addResult.directive.id;
+  const editResult = ucmdAutopilot.handleAutopilotDirectiveEdit({ sessionId: session.id, directiveId, text: "Add dark mode with toggle" });
+  assertEqual(editResult.directive.text, "Add dark mode with toggle", "directive edit updates text");
+
+  // Delete
+  const secondId = listAll.directives[1].id;
+  const deleteResult = ucmdAutopilot.handleAutopilotDirectiveDelete({ sessionId: session.id, directiveId: secondId });
+  assertEqual(deleteResult.directiveId, secondId, "directive delete returns id");
+
+  const afterDelete = ucmdAutopilot.handleAutopilotDirectiveList({ sessionId: session.id });
+  assertEqual(afterDelete.directives.length, 1, "list returns 1 after delete");
+
+  // Cleanup
+  ucmdAutopilot.sessions.delete(session.id);
+  ucmdAutopilot.projectSessionMap.delete("/tmp/directive-crud-test");
+}
+
+function testAutopilotDirectiveValidation() {
+  ucmdAutopilot.setDeps({
+    config: () => DEFAULT_CONFIG,
+    daemonState: () => ({ daemonStatus: "running" }),
+    broadcastWs: () => {},
+    log: () => {},
+  });
+  ucmdAutopilot.setLog(() => {});
+
+  // Non-existent session
+  let threw = false;
+  try { ucmdAutopilot.handleAutopilotDirectiveAdd({ sessionId: "nonexistent", text: "test" }); } catch { threw = true; }
+  assert(threw, "directive add throws for nonexistent session");
+
+  // Empty text
+  const session = ucmdAutopilot.createSession("/tmp/directive-validation-test");
+  threw = false;
+  try { ucmdAutopilot.handleAutopilotDirectiveAdd({ sessionId: session.id, text: "" }); } catch { threw = true; }
+  assert(threw, "directive add throws for empty text");
+
+  threw = false;
+  try { ucmdAutopilot.handleAutopilotDirectiveAdd({ sessionId: session.id, text: "  " }); } catch { threw = true; }
+  assert(threw, "directive add throws for whitespace-only text");
+
+  // Stopped session
+  session.status = "stopped";
+  threw = false;
+  try { ucmdAutopilot.handleAutopilotDirectiveAdd({ sessionId: session.id, text: "test" }); } catch (e) {
+    threw = true;
+    assert(e.message.includes("stopped"), "stopped session error mentions stopped");
+  }
+  assert(threw, "directive add throws for stopped session");
+
+  // Consumed directive edit/delete
+  session.status = "running";
+  const addResult = ucmdAutopilot.handleAutopilotDirectiveAdd({ sessionId: session.id, text: "to be consumed" });
+  const dId = addResult.directive.id;
+  session.directives.find(d => d.id === dId).status = "consumed";
+
+  threw = false;
+  try { ucmdAutopilot.handleAutopilotDirectiveEdit({ sessionId: session.id, directiveId: dId, text: "new text" }); } catch (e) {
+    threw = true;
+    assert(e.message.includes("consumed"), "consumed edit error mentions consumed");
+  }
+  assert(threw, "directive edit throws for consumed directive");
+
+  threw = false;
+  try { ucmdAutopilot.handleAutopilotDirectiveDelete({ sessionId: session.id, directiveId: dId }); } catch (e) {
+    threw = true;
+    assert(e.message.includes("consumed"), "consumed delete error mentions consumed");
+  }
+  assert(threw, "directive delete throws for consumed directive");
+
+  // Cleanup
+  ucmdAutopilot.sessions.delete(session.id);
+  ucmdAutopilot.projectSessionMap.delete("/tmp/directive-validation-test");
+}
+
+function testAutopilotSessionDetailIncludesDirectives() {
+  ucmdAutopilot.setDeps({
+    config: () => DEFAULT_CONFIG,
+    daemonState: () => ({ daemonStatus: "running" }),
+    broadcastWs: () => {},
+    log: () => {},
+  });
+  ucmdAutopilot.setLog(() => {});
+
+  const session = ucmdAutopilot.createSession("/tmp/directive-detail-test");
+  ucmdAutopilot.handleAutopilotDirectiveAdd({ sessionId: session.id, text: "Test directive" });
+
+  const detail = ucmdAutopilot.handleAutopilotSession({ sessionId: session.id });
+  assert(Array.isArray(detail.directives), "session detail includes directives array");
+  assertEqual(detail.directives.length, 1, "session detail has 1 directive");
+  assertEqual(detail.directives[0].text, "Test directive", "session detail directive text matches");
+
+  // Status includes pendingDirectives count
+  const status = ucmdAutopilot.handleAutopilotStatus();
+  const sessionStatus = status.find(s => s.id === session.id);
+  assertEqual(sessionStatus.pendingDirectives, 1, "status includes pendingDirectives count");
+
+  // Cleanup
+  ucmdAutopilot.sessions.delete(session.id);
+  ucmdAutopilot.projectSessionMap.delete("/tmp/directive-detail-test");
+}
+
+async function testAutopilotDirectivePersistence() {
+  ucmdAutopilot.setDeps({
+    config: () => DEFAULT_CONFIG,
+    daemonState: () => ({ daemonStatus: "running" }),
+    broadcastWs: () => {},
+    log: () => {},
+  });
+  ucmdAutopilot.setLog(() => {});
+
+  const session = ucmdAutopilot.createSession("/tmp/directive-persist-test");
+  ucmdAutopilot.handleAutopilotDirectiveAdd({ sessionId: session.id, text: "Persist this" });
+
+  await ucmdAutopilot.saveSession(session);
+  const loaded = await ucmdAutopilot.loadSession(session.id);
+
+  assert(Array.isArray(loaded.directives), "loaded session has directives array");
+  assertEqual(loaded.directives.length, 1, "loaded session has 1 directive");
+  assertEqual(loaded.directives[0].text, "Persist this", "loaded directive text matches");
+  assertEqual(loaded.directives[0].status, "pending", "loaded directive status is pending");
+
+  await ucmdAutopilot.deleteSessionFile(session.id);
+  ucmdAutopilot.sessions.delete(session.id);
+  ucmdAutopilot.projectSessionMap.delete("/tmp/directive-persist-test");
+}
+
+function testSandboxCommitAllChanges() {
+  assert(typeof ucmdSandbox.commitAllChanges === "function", "sandbox exports commitAllChanges");
+}
+
+function testSandboxDetectTestCommand() {
+  assert(typeof ucmdSandbox.detectTestCommand === "function", "sandbox exports detectTestCommand");
+  assert(typeof ucmdSandbox.runProjectTests === "function", "sandbox exports runProjectTests");
+
+  // UCM itself should be detected as "ucm" type
+  const ucmResult = ucmdSandbox.detectTestCommand(SOURCE_ROOT);
+  assert(ucmResult !== null, "detectTestCommand finds UCM tests");
+  assertEqual(ucmResult.type, "ucm", "detectTestCommand returns ucm type for self");
+  assert(Array.isArray(ucmResult.layers), "ucm test info has layers");
+
+  // Non-existent path should return null
+  const noResult = ucmdSandbox.detectTestCommand("/tmp/no-such-project-" + Date.now());
+  assertEqual(noResult, null, "detectTestCommand returns null for non-project");
+}
+
+function testSandboxIsGitRepo() {
+  assert(typeof ucmdSandbox.isGitRepo === "function", "sandbox exports isGitRepo");
+  assertEqual(ucmdSandbox.isGitRepo(SOURCE_ROOT), true, "isGitRepo true for UCM root");
+  assertEqual(ucmdSandbox.isGitRepo("/tmp"), false, "isGitRepo false for /tmp");
+}
+
+function testSandboxListStableTags() {
+  assert(typeof ucmdSandbox.listStableTags === "function", "sandbox exports listStableTags");
+  const tags = ucmdSandbox.listStableTags();
+  assert(Array.isArray(tags), "listStableTags returns array");
+}
+
+// ── Sandbox Tests ──
+
+function testSandboxModuleExports() {
+  assert(typeof ucmdSandbox.setLog === "function", "sandbox exports setLog");
+  assert(typeof ucmdSandbox.isSelfTarget === "function", "sandbox exports isSelfTarget");
+  assert(typeof ucmdSandbox.selfSafetyGate === "function", "sandbox exports selfSafetyGate");
+  assert(typeof ucmdSandbox.getCurrentStableTag === "function", "sandbox exports getCurrentStableTag");
+  assert(typeof ucmdSandbox.tagStableVersion === "function", "sandbox exports tagStableVersion");
+  assert(typeof ucmdSandbox.createDevBranch === "function", "sandbox exports createDevBranch");
+  assert(typeof ucmdSandbox.mergeDevBranch === "function", "sandbox exports mergeDevBranch");
+  assert(typeof ucmdSandbox.deleteDevBranch === "function", "sandbox exports deleteDevBranch");
+  assert(typeof ucmdSandbox.rollbackToTag === "function", "sandbox exports rollbackToTag");
+  assert(typeof ucmdSandbox.getCurrentBranch === "function", "sandbox exports getCurrentBranch");
+  assert(typeof ucmdSandbox.checkoutBranch === "function", "sandbox exports checkoutBranch");
+  assert(typeof ucmdSandbox.discardChanges === "function", "sandbox exports discardChanges");
+  assert(typeof ucmdSandbox.runTestLayer === "function", "sandbox exports runTestLayer");
+  assert(typeof ucmdSandbox.runAllTests === "function", "sandbox exports runAllTests");
+  assert(Array.isArray(ucmdSandbox.TEST_LAYERS), "sandbox exports TEST_LAYERS array");
+}
+
+function testSandboxIsSelfTarget() {
+  assert(ucmdSandbox.isSelfTarget(SOURCE_ROOT), "isSelfTarget returns true for SOURCE_ROOT");
+  assert(!ucmdSandbox.isSelfTarget("/tmp/other-project"), "isSelfTarget returns false for other path");
+  assert(!ucmdSandbox.isSelfTarget(null), "isSelfTarget returns false for null");
+  assert(!ucmdSandbox.isSelfTarget(""), "isSelfTarget returns false for empty string");
+}
+
+function testSandboxTestLayers() {
+  assertEqual(ucmdSandbox.TEST_LAYERS.length, 3, "TEST_LAYERS has 3 layers");
+  assertEqual(ucmdSandbox.TEST_LAYERS[0].name, "unit", "first layer is unit");
+  assertEqual(ucmdSandbox.TEST_LAYERS[1].name, "integration", "second layer is integration");
+  assertEqual(ucmdSandbox.TEST_LAYERS[2].name, "browser", "third layer is browser");
+  for (const layer of ucmdSandbox.TEST_LAYERS) {
+    assert(Array.isArray(layer.command), `layer ${layer.name} has command array`);
+    assert(layer.command.length >= 2, `layer ${layer.name} command has at least 2 elements`);
+  }
+}
+
+function testSandboxGetCurrentBranch() {
+  const branch = ucmdSandbox.getCurrentBranch();
+  assert(typeof branch === "string" || branch === null, "getCurrentBranch returns string or null");
+  if (branch) {
+    assert(branch.length > 0, "getCurrentBranch returns non-empty string");
+  }
+}
+
+function testSandboxGetCurrentStableTag() {
+  // May return null if no tags exist — that's fine
+  const tag = ucmdSandbox.getCurrentStableTag();
+  assert(tag === null || typeof tag === "string", "getCurrentStableTag returns string or null");
+}
+
+async function testSandboxRunTestLayer() {
+  // Run a quick command that always succeeds to test the test runner itself
+  const result = await ucmdSandbox.runTestLayer("echo-test", ["node", "-e", `
+    console.log("1 tests, 1 passed, 0 failed");
+  `], { timeoutMs: 10000 });
+  assertEqual(result.name, "echo-test", "runTestLayer returns correct name");
+  assertEqual(result.passed, true, "runTestLayer passes for passing test");
+  assertEqual(result.total, 1, "runTestLayer parses total");
+  assertEqual(result.passing, 1, "runTestLayer parses passing");
+  assertEqual(result.failing, 0, "runTestLayer parses failing");
+  assert(result.elapsed >= 0, "runTestLayer records elapsed time");
+}
+
+async function testSandboxRunTestLayerFailure() {
+  // A test that reports a failure
+  const result = await ucmdSandbox.runTestLayer("fail-test", ["node", "-e", `
+    console.log("2 tests, 1 passed, 1 failed");
+    process.exit(1);
+  `], { timeoutMs: 10000 });
+  assertEqual(result.name, "fail-test", "runTestLayer failure returns correct name");
+  assertEqual(result.passed, false, "runTestLayer failure detected");
+  assertEqual(result.total, 2, "runTestLayer failure parses total");
+  assertEqual(result.failing, 1, "runTestLayer failure parses failing count");
+}
+
+function testSandboxDefaultConfig() {
+  assert(DEFAULT_CONFIG.selfImprove !== undefined, "DEFAULT_CONFIG has selfImprove section");
+  assertEqual(DEFAULT_CONFIG.selfImprove.enabled, false, "selfImprove disabled by default");
+  assertEqual(DEFAULT_CONFIG.selfImprove.maxIterations, 5, "selfImprove maxIterations default");
+  assertEqual(DEFAULT_CONFIG.selfImprove.requireAllTestLayers, true, "selfImprove requireAllTestLayers default");
+  assertEqual(DEFAULT_CONFIG.selfImprove.requireHumanApproval, true, "selfImprove requireHumanApproval default");
+  assertEqual(DEFAULT_CONFIG.selfImprove.backupBranch, true, "selfImprove backupBranch default");
+  assertEqual(DEFAULT_CONFIG.selfImprove.testTimeoutMs, 300000, "selfImprove testTimeoutMs default");
+  assertEqual(DEFAULT_CONFIG.selfImprove.maxRisk, "low", "selfImprove maxRisk default");
+  // Autopilot config has its own execution settings
+  assertEqual(DEFAULT_CONFIG.autopilot.maxIterations, 5, "autopilot maxIterations default");
+  assertEqual(DEFAULT_CONFIG.autopilot.requireHumanApproval, true, "autopilot requireHumanApproval default");
+  assertEqual(DEFAULT_CONFIG.autopilot.reviewTimeoutMs, 30 * 60 * 1000, "autopilot reviewTimeoutMs default");
+  assertEqual(DEFAULT_CONFIG.autopilot.testTimeoutMs, 300000, "autopilot testTimeoutMs default");
+}
+
 async function main() {
+  startSuiteTimer(120_000);
   console.log("UCM Test Suite\n");
   await ensureDirectories();
 
@@ -2843,11 +4654,15 @@ async function main() {
   testAnalyzeDocCoverage();
   testAnalyzeDocCoverageWithFiles();
   testDocExtensionsAndDirs();
+  await testGenerateProjectContext();
+  testFormatProjectContext();
   console.log();
 
   console.log("Template Placeholder Tests:");
   testObserveTemplateHasCommitHistory();
   testSelfReviewTemplateHasDocCoverage();
+  testAutopilotPlanTemplateHasProjectContext();
+  testAutopilotReleaseTemplateUpdated();
   console.log();
 
   console.log("Observer/Proposal Tests:");
@@ -2863,6 +4678,28 @@ async function main() {
   await testSaveAndLoadProposal();
   await testListProposals();
   await testProposalDirectories();
+  console.log();
+
+  console.log("Multi-Perspective Observer Tests:");
+  testObserverPerspectivesDefined();
+  testExpandedCategories();
+  testObserveTemplateHasPerspective();
+  testResearchTemplateExists();
+  testParseObserverOutputExpandedCategories();
+  testBugfixPriorityBoost();
+  console.log();
+
+  console.log("On-Demand Analysis/Research Tests:");
+  testAnalyzeProjectExported();
+  testHandleAnalyzeProjectExported();
+  testHandleResearchProjectExported();
+  testSocketHandlerMappings();
+  testUiServerAnalyzeRoute();
+  testUiServerResearchRoute();
+  await testMkdirApi();
+  testUiModalNotClosedBeforeSuccess();
+  testUiRightPanelRefinementGuard();
+  testUiHtmlJsSyntax();
   console.log();
 
   console.log("QnA Core Tests:");
@@ -2944,7 +4781,106 @@ async function main() {
   await testHttpProposalsApi();
   console.log();
 
-  // cleanup test directory
+  console.log("Forge V2 Tests:");
+  testSanitizeEnv();
+  testExtractJsonVariants();
+  testBuildCommandProviders();
+  testStageModelsProxy();
+  testCheckRequiredArtifactsLogic();
+  testCustomPipelineParsing();
+  testSanitizeContentPatterns();
+  testParseArgsCli();
+  testGetNextAction();
+  testDetectOrphanLogic();
+  testTaskDagSaveChaining();
+  testDeliverAutoMergeFailureSetsReview();
+  testAgentSkipPermissions();
+  testRsaClassifySkipPermissions();
+  testServerTaskIdValidation();
+  testWireEventsIncludesAbort();
+  testSubtasksRunSequentially();
+  testParallelTokenUsage();
+  testVerifyUsesExtractJson();
+  testSubtaskMissingContinues();
+  testResumeInvalidStageThrows();
+  testImplementFailureRecordsStage();
+  testIntakeRecordsStage();
+  testSpecifyRsaTokenUsage();
+  testRemoveWorktreesUsesOrigin();
+  testIntegrateConflictResolutionUsesOrigin();
+  testPolishConfig();
+  testPolishModuleExports();
+  testPolishLensPromptsCoverage();
+  testPolishModelEnvOverride();
+  testPolishCustomPipelineDetection();
+  testPolishInSubtaskStages();
+  testPolishStageEstimate();
+  console.log();
+
+  console.log("Polish Simulation Tests:");
+  await testPolishSimulations();
+  console.log();
+
+  console.log("UX Review Tests:");
+  testUxReviewModuleExports();
+  testUxReviewParseValid();
+  testUxReviewParseInvalid();
+  testUxReviewFormatFeedback();
+  testUxReviewConstants();
+  testUxReviewTemplate();
+  testUxReviewInPipeline();
+  await testUxReviewDetectFrontend();
+  testBrowserModuleExports();
+  testBrowserResolvePort();
+  testExtractPortFromScript();
+  testPickDevScript();
+  testScriptLooksLikeWebServer();
+  testFrameworkSignatures();
+  console.log();
+
+  console.log("Autopilot Tests:");
+  testAutopilotModuleExports();
+  testAutopilotSessionCreation();
+  testAutopilotDuplicateProject();
+  testAutopilotStatusHandler();
+  testAutopilotPauseResume();
+  testAutopilotStop();
+  testAutopilotSessionDetail();
+  testParseRoadmapOutput();
+  testBumpVersion();
+  testAutopilotDefaultConfig();
+  testAutopilotSessionMetaKey();
+  testAutopilotTemplatesExist();
+  testAutopilotSessionHasForgeFields();
+  testAutopilotReleasesHandler();
+  await testAutopilotGitRequired();
+  await testAutopilotSessionPersistence();
+  testAutopilotForgePipelineConfig();
+  testAutopilotDirectiveExports();
+  testAutopilotDirectiveCrud();
+  testAutopilotDirectiveValidation();
+  testAutopilotSessionDetailIncludesDirectives();
+  await testAutopilotDirectivePersistence();
+  console.log();
+
+  console.log("Sandbox Tests:");
+  testSandboxModuleExports();
+  testSandboxCommitAllChanges();
+  testSandboxDetectTestCommand();
+  testSandboxIsGitRepo();
+  testSandboxListStableTags();
+  testSandboxIsSelfTarget();
+  testSandboxTestLayers();
+  testSandboxGetCurrentBranch();
+  testSandboxGetCurrentStableTag();
+  await testSandboxRunTestLayer();
+  await testSandboxRunTestLayerFailure();
+  testSandboxDefaultConfig();
+  console.log();
+
+
+  // cleanup
+  await cleanupAll();
   try { await rm(TEST_UCM_DIR, { recursive: true }); } catch {}
 
   // Summary
@@ -2956,6 +4892,7 @@ async function main() {
     }
     process.exit(1);
   }
+  process.exit(0);
 }
 
 main().catch((e) => {

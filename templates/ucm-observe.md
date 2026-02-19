@@ -30,11 +30,25 @@ Improvements can target UCM itself (templates, config, core) or specific project
 
 {{DOC_COVERAGE_SUMMARY}}
 
+## Hivemind Knowledge (past forge experience)
+
+{{HIVEMIND_KNOWLEDGE}}
+
+## Evaluation History (past proposal outcomes)
+
+{{EVALUATION_HISTORY}}
+
 ## Existing Proposals (do NOT re-propose)
 
 {{EXISTING_PROPOSALS}}
 
 ---
+
+## Review Perspective
+
+{{PERSPECTIVE_FOCUS}}
+
+위 관점에 집중하여 분석하되, 데이터에서 발견한 다른 중요한 이슈도 포함하세요.
 
 ## Instructions
 
@@ -43,12 +57,13 @@ Improvements can target UCM itself (templates, config, core) or specific project
 3. Examine code structure for modularization opportunities: files >500 lines, high function counts suggesting low cohesion, or projects with many large files.
 4. Review commit history: large commits suggest need for smaller changes, low frequency may indicate batch coding patterns.
 5. Check documentation coverage: missing README, no docs directory, or low doc-to-source ratio may indicate documentation gaps.
-6. For each issue found, propose a specific change. Be precise about what file to change and how.
-7. Every proposal MUST cite data (task IDs, error patterns, metric values).
-8. Do NOT propose anything already in the existing proposals list.
-9. Do NOT propose abstract improvements like "improve quality" — only concrete, implementable changes.
-10. Prefer low-risk template/config changes over core code changes.
-11. Output 0 proposals if no actionable improvements are found.
+6. Review evaluation history: reinforce patterns from positive verdicts (similar approaches), avoid patterns from negative verdicts (similar approaches blocked).
+7. For each issue found, propose a specific change. Be precise about what file to change and how.
+8. Every proposal MUST cite data (task IDs, error patterns, metric values).
+9. Do NOT propose anything already in the existing proposals list.
+10. Do NOT propose abstract improvements like "improve quality" — only concrete, implementable changes.
+11. Prefer low-risk template/config changes over core code changes.
+12. Output 0 proposals if no actionable improvements are found.
 
 ## Output Format
 
@@ -71,7 +86,7 @@ Output a JSON array (0–5 items). Wrap in a ```json fenced block.
 
 Fields:
 - **title**: short descriptive title (Korean OK)
-- **category**: one of `template`, `core`, `config`, `test`
+- **category**: one of `template`, `core`, `config`, `test`, `bugfix`, `ux`, `architecture`, `performance`, `docs`, `research`
 - **risk**: one of `low`, `medium`, `high`
 - **project**: target project path (absolute), or `null` for UCM-level changes (templates, core, config)
 - **problem**: data-backed description of the issue

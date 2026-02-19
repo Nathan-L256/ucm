@@ -1,11 +1,9 @@
 {
   "name": "ucm",
-  "version": "0.1.0",
-  "description": "Ultimate Click Machine — 소프트웨어 팩토리 빌딩 블록",
+  "version": "0.2.0",
+  "description": "UCM Forge — 소프트웨어 팩토리",
   "bin": {
-    "mem": "./bin/mem.js",
-    "memd": "./bin/memd.js",
-    "rsa": "./bin/rsa.js",
+"rsa": "./bin/rsa.js",
     "qna": "./bin/qna.js",
     "spec": "./bin/spec.js",
     "prl": "./bin/prl.js",
@@ -16,7 +14,7 @@
     "hm": "./bin/hm.js",
     "hmd": "./bin/hmd.js"
   },
-  "main": "./lib/mem.js",
+  "main": "./lib/core/llm.js",
   "files": [
     "bin/",
     "lib/",
@@ -26,7 +24,7 @@
     "docs/"
   ],
   "scripts": {
-    "test": "node test/ucm.test.js && node test/hivemind.test.js",
+    "test": "node test/ucm.test.js && node test/hivemind.test.js && node test/integration.js && node test/browser.js",
     "postinstall": "node scripts/postinstall.js",
     "install-skill": "node scripts/install-skill.js"
   },
