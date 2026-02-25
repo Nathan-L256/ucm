@@ -1,3 +1,4 @@
+https://github.com/s1ddh1k/ucm 에서 추가적인 개발이 진행 중입니다.
 # ucm — Ultimate Click Machine
 
 AI 에이전트 오케스트레이션 시스템. 데몬이 Git worktree로 태스크를 격리하고, 파이프라인 스테이지별로 AI를 spawn하여 코드 작업을 자동화한다.
